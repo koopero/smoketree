@@ -210,6 +210,39 @@ paths. Instances cache independently:
 sidecar recording which inputs produced it. Adding one source file rebuilds only the new
 combinations; everything else stays cached.
 
+### Tagged collections and `filter_tag`
+
+Instead of a glob, a collection may declare explicit `sources` with per-item `tags`
+(`glob` and `sources` are mutually exclusive). Tags are arbitrary role labels:
+
+```yaml
+references:
+  type: collection
+  sources:
+    - { path: sources/watch_front.jpg, tags: [subject, primary] }
+    - { path: sources/watch_side.jpg,  tags: [subject] }
+    - { path: sources/mood_board.jpg,  tags: [style] }
+```
+
+A transform input can then filter a collection by tag. Two equivalent forms:
+
+```yaml
+inputs:
+  subject: references[subject]            # shorthand
+  style:   { node: references, filter_tag: style }   # long form
+  prompt:  prompt_node                    # untagged scalar reference, unchanged
+```
+
+Filter resolution:
+- **multiple** matches → behaves as a collection input (declare `expand`);
+- **single** match → behaves as a scalar input (no `expand` needed);
+- **zero** matches → hard error at run time;
+- `filter_tag` on an input whose producer is **not** a collection → parse-time error.
+
+This is how multi-reference pipelines work (e.g. a ComfyUI transformer with named
+`subject`/`style`/`structure` image inputs, each injected at its own workflow node). For
+fixed pipelines you can skip tagging and wire named scalar `source` nodes directly.
+
 ---
 
 ## CLI workflow

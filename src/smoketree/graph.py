@@ -8,6 +8,7 @@ mismatches are hard errors.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,8 +16,10 @@ from pydantic import ValidationError as PydanticValidationError
 
 from .errors import ValidationError
 from .loader import load_yaml
-from .models import GraphDef, MediaType, NodeDef, Transformer
+from .models import GraphDef, InputDecl, InputValue, MediaType, NodeDef, Transformer
 from .project import Project
+
+_SHORTHAND_TAG = re.compile(r"^(.+)\[([^\]]+)\]$")
 
 # Map common file extensions to media types, used to infer the media type of a
 # source artifact for parse-time validation.
@@ -39,15 +42,30 @@ def infer_media_from_path(path: Path) -> MediaType | None:
 
 @dataclass
 class InputRef:
-    """A parsed ``node_id`` or ``node_id.output_name`` input reference."""
+    """A parsed input reference: producing node, optional output, optional tag filter."""
 
     node_id: str
     output_name: str | None  # None means "first declared output"
+    filter_tag: str | None = None
 
     @classmethod
-    def parse(cls, raw: str) -> "InputRef":
+    def parse(cls, value: InputValue) -> "InputRef":
+        if isinstance(value, InputDecl):
+            node_id, output_name = cls._split_output(value.node)
+            return cls(node_id, output_name, value.filter_tag)
+        # string form, possibly with the "node[tag]" shorthand
+        raw = value
+        filter_tag: str | None = None
+        match = _SHORTHAND_TAG.match(raw)
+        if match:
+            raw, filter_tag = match.group(1), match.group(2)
+        node_id, output_name = cls._split_output(raw)
+        return cls(node_id, output_name, filter_tag)
+
+    @staticmethod
+    def _split_output(raw: str) -> tuple[str, str | None]:
         node_id, sep, output_name = raw.partition(".")
-        return cls(node_id=node_id, output_name=output_name if sep else None)
+        return node_id, (output_name if sep else None)
 
 
 @dataclass
@@ -60,6 +78,8 @@ class ResolvedGraph:
     execution_order: list[str] = field(default_factory=list)
     # node_id -> whether the node resolves to multiple artifacts (a collection)
     collections: dict[str, bool] = field(default_factory=dict)
+    # node_id -> set of input names that are collection (fan-out) inputs
+    collection_inputs: dict[str, set[str]] = field(default_factory=dict)
 
     def is_collection(self, node_id: str) -> bool:
         return self.collections.get(node_id, False)
@@ -132,10 +152,29 @@ def _resolve_collections(graph: ResolvedGraph) -> None:
         collection_inputs = [
             name
             for name, ref in graph.input_refs[node_id].items()
-            if graph.is_collection(ref.node_id)
+            if _input_is_collection(graph, ref)
         ]
+        graph.collection_inputs[node_id] = set(collection_inputs)
         graph.collections[node_id] = bool(collection_inputs)
         _validate_expand(node_id, node, collection_inputs)
+
+
+def _input_is_collection(graph: ResolvedGraph, ref: InputRef) -> bool:
+    """Whether an input fans out: it references a collection that resolves to >1 item.
+
+    For tag-filtered references into an explicitly-sourced collection the matching
+    count is known statically (single match -> scalar). A filtered glob collection
+    has unknown size, so it is treated as a collection.
+    """
+    if not graph.is_collection(ref.node_id):
+        return False
+    if ref.filter_tag is None:
+        return True
+    producer = graph.nodes[ref.node_id]
+    if producer.sources is not None:
+        matches = sum(1 for s in producer.sources if ref.filter_tag in s.tags)
+        return matches > 1
+    return True
 
 
 def _validate_expand(
@@ -179,13 +218,15 @@ def _validate_node_shapes(
                     f"Source node '{node_id}' must not declare a transformer or inputs."
                 )
         elif node.type == "collection":
-            if not node.glob:
+            if bool(node.glob) == bool(node.sources):
                 raise ValidationError(
-                    f"Collection node '{node_id}' must declare a 'glob'."
+                    f"Collection node '{node_id}' must declare exactly one of "
+                    f"'glob' or 'sources'."
                 )
             if node.transformer or node.inputs or node.path:
                 raise ValidationError(
-                    f"Collection node '{node_id}' must declare only a 'glob'."
+                    f"Collection node '{node_id}' must declare only 'glob' or "
+                    f"'sources'."
                 )
         else:  # transform
             if not node.transformer:
@@ -239,6 +280,12 @@ def _validate_references(
                     f"'{ref.node_id}.{ref.output_name}', but '{ref.node_id}' is a "
                     f"{producer.type} node with a single output."
                 )
+            if ref.filter_tag is not None and producer.type != "collection":
+                raise ValidationError(
+                    f"Node '{node_id}' input '{input_name}' uses filter_tag "
+                    f"'{ref.filter_tag}', but '{ref.node_id}' is a {producer.type} "
+                    f"node, not a collection."
+                )
 
 
 def _topological_sort(
@@ -290,6 +337,13 @@ def _producer_media(graph: ResolvedGraph, ref: InputRef) -> MediaType | None:
     if producer.type == "source":
         return infer_media_from_path(Path(producer.path or ""))
     if producer.type == "collection":
+        if producer.sources is not None:
+            items = [
+                s
+                for s in producer.sources
+                if ref.filter_tag is None or ref.filter_tag in s.tags
+            ]
+            return infer_media_from_path(Path(items[0].path)) if items else None
         return infer_media_from_path(Path(producer.glob or ""))
     transformer = graph.transformers[ref.node_id]
     outputs = transformer.outputs

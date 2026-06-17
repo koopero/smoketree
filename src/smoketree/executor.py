@@ -1,7 +1,6 @@
 """Execution: input resolution, fan-out, caching, dirs, seed injection, dispatch.
 
-Implements the execution flow from DESIGN.md plus the collection/fan-out model from
-DESIGN_ADDENDUM.md. Every node resolves to a *list* of artifacts: sources and plain
+Every node resolves to a *list* of artifacts: sources and plain
 transforms produce one; collection nodes and transforms that consume collections produce
 many. A fanned-out transform expands its collection inputs (``product``/``zip``/``each``)
 into independent *instances*, each with its own cache key, instance directory, and state
@@ -92,23 +91,28 @@ class Resolver:
         self.project = project
         self.graph = graph
         self.take = take
-        self._produced: dict[tuple[str, str], list[Artifact]] = {}
+        self._produced: dict[tuple[str, str, str | None], list[Artifact]] = {}
         self._instances: dict[str, list[Instance]] = {}
+        self._collection_items: dict[str, list[tuple[Artifact, frozenset[str]]]] = {}
 
-    def produced_artifacts(self, node_id: str, output_name: str) -> list[Artifact]:
-        cache_key = (node_id, output_name)
+    def produced_artifacts(
+        self, node_id: str, output_name: str, filter_tag: str | None = None
+    ) -> list[Artifact]:
+        cache_key = (node_id, output_name, filter_tag)
         if cache_key in self._produced:
             return self._produced[cache_key]
-        result = self._produced_artifacts(node_id, output_name)
+        result = self._produced_artifacts(node_id, output_name, filter_tag)
         self._produced[cache_key] = result
         return result
 
-    def _produced_artifacts(self, node_id: str, output_name: str) -> list[Artifact]:
+    def _produced_artifacts(
+        self, node_id: str, output_name: str, filter_tag: str | None
+    ) -> list[Artifact]:
         node = self.graph.nodes[node_id]
         if node.type == "source":
             return [resolve_source_artifact(self.project, node.path or "")]
         if node.type == "collection":
-            return self._collection_artifacts(node_id, node.glob or "")
+            return self._filter_collection(node_id, filter_tag)
 
         # transform: one artifact per instance
         transformer = self.graph.transformers[node_id]
@@ -126,22 +130,49 @@ class Resolver:
             artifacts.append(art)
         return artifacts
 
-    def _collection_artifacts(self, node_id: str, glob: str) -> list[Artifact]:
-        paths = sorted(self.project.root.glob(glob))
-        files = [p for p in paths if p.is_file()]
-        if not files:
-            raise ExecutionError(
-                f"Collection node '{node_id}' glob '{glob}' matched no files."
+    def _filter_collection(
+        self, node_id: str, filter_tag: str | None
+    ) -> list[Artifact]:
+        items = self._collection_items_for(node_id)
+        if filter_tag is not None:
+            items = [(art, tags) for art, tags in items if filter_tag in tags]
+        if not items:
+            detail = (
+                f"filter_tag '{filter_tag}' matched no items"
+                if filter_tag is not None
+                else "matched no files"
             )
-        return [
-            Artifact(
-                path=p.resolve(),
-                media=infer_media_from_path(p) or "data",
-                format=p.suffix.lstrip(".").lower() or None,
-                content_hash=cachelib.hash_file(p),
+            raise ExecutionError(f"Collection node '{node_id}' {detail}.")
+        return [art for art, _ in items]
+
+    def _collection_items_for(
+        self, node_id: str
+    ) -> list[tuple[Artifact, frozenset[str]]]:
+        if node_id in self._collection_items:
+            return self._collection_items[node_id]
+        node = self.graph.nodes[node_id]
+        items: list[tuple[Artifact, frozenset[str]]] = []
+        if node.sources is not None:
+            for src in node.sources:
+                items.append(
+                    (resolve_source_artifact(self.project, src.path), frozenset(src.tags))
+                )
+        else:
+            files = sorted(
+                p for p in self.project.root.glob(node.glob or "") if p.is_file()
             )
-            for p in files
-        ]
+            for p in files:
+                items.append((
+                    Artifact(
+                        path=p.resolve(),
+                        media=infer_media_from_path(p) or "data",
+                        format=p.suffix.lstrip(".").lower() or None,
+                        content_hash=cachelib.hash_file(p),
+                    ),
+                    frozenset(),
+                ))
+        self._collection_items[node_id] = items
+        return items
 
     def _read_instance_output(
         self, node_id: str, output_name: str, inst_hash: str | None, media
@@ -171,16 +202,17 @@ class Resolver:
     def _transform_instances(self, node_id: str) -> list[Instance]:
         refs = self.graph.input_refs.get(node_id, {})
         input_lists = {
-            name: self.produced_artifacts(ref.node_id, _ref_output(self.graph, ref))
+            name: self.produced_artifacts(
+                ref.node_id, _ref_output(self.graph, ref), ref.filter_tag
+            )
             for name, ref in refs.items()
         }
-        collection_inputs = [
-            name for name, ref in refs.items() if self.graph.is_collection(ref.node_id)
-        ]
+        coll_names = self.graph.collection_inputs.get(node_id, set())
+        collection_inputs = [name for name in refs if name in coll_names]
         singletons = {
             name: input_lists[name][0]
             for name in refs
-            if name not in collection_inputs
+            if name not in coll_names
         }
         if not collection_inputs:
             return [Instance(inputs=dict(singletons))]

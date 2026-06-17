@@ -1,6 +1,6 @@
 """Pydantic models for project config, graphs, and transformers.
 
-These mirror the internal data model in DESIGN.md. Parsed YAML is validated into these
+These define the internal data model. Parsed YAML is validated into these
 shapes; runtime resolution (topological order, artifact paths) is layered on top in
 ``graph.py`` and ``executor.py``.
 """
@@ -43,6 +43,29 @@ class ProjectConfig(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
+class CollectionSource(BaseModel):
+    """One explicitly-declared, optionally-tagged item of a collection node."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    tags: list[str] = Field(default_factory=list)
+
+
+class InputDecl(BaseModel):
+    """Long-form input declaration: ``{node: ..., filter_tag: ...}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node: str
+    filter_tag: str | None = None
+
+
+# An input value is either a string ("node", "node.output", or the "node[tag]"
+# shorthand) or the long-form mapping.
+InputValue = Union[str, InputDecl]
+
+
 class NodeDef(BaseModel):
     """A node as declared in a graph YAML file (before resolution)."""
 
@@ -51,11 +74,12 @@ class NodeDef(BaseModel):
     type: Literal["source", "transform", "collection"]
     # source nodes:
     path: str | None = None
-    # collection nodes:
+    # collection nodes (exactly one of glob / sources):
     glob: str | None = None
+    sources: list[CollectionSource] | None = None
     # transform nodes:
     transformer: str | None = None
-    inputs: dict[str, str] = Field(default_factory=dict)
+    inputs: dict[str, InputValue] = Field(default_factory=dict)
     # fan-out strategy; required iff a transform consumes a collection input
     expand: ExpandStrategy | None = None
 
@@ -143,7 +167,7 @@ class ComfyUITransformer(_BaseTransformer):
 
 
 class HTTPTransformer(_BaseTransformer):
-    """Generic HTTP request transformer (declared in DESIGN.md as future work)."""
+    """Generic HTTP request transformer (future work; parsed but not executable)."""
 
     model_config = ConfigDict(extra="allow")
 

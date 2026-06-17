@@ -92,6 +92,33 @@ nodes:
     expand: each
 """
 
+_TAGGED_GRAPH = """\
+name: tagged
+
+# Tagged collection + filter_tag. `refs` items carry role tags; `loud` filters to the
+# 'shout' tag (2 items -> fan-out), `quiet` filters to 'whisper' (1 item -> scalar).
+nodes:
+  refs:
+    type: collection
+    sources:
+      - {path: sources/items/one.txt, tags: [shout, primary]}
+      - {path: sources/items/two.txt, tags: [shout]}
+      - {path: sources/items/three.txt, tags: [whisper]}
+
+  loud:
+    type: transform
+    transformer: shout
+    inputs:
+      input: refs[shout]
+    expand: each
+
+  quiet:
+    type: transform
+    transformer: shout
+    inputs:
+      input: refs[whisper]
+"""
+
 _SHELL_TRANSFORMER = """\
 name: {name}
 type: shell
@@ -175,7 +202,7 @@ nodes:
 """
 
 _DESCRIBE = """\
-# Milestone 2 shell stub. Swap for the claude version (see DESIGN.md) for real output.
+# Shell stub. Swap for a `type: claude` or `type: ollama` transformer for real output.
 name: describe
 type: shell
 command: python scripts/describe.py --image {inputs.image} --out {outputs.text}
@@ -360,6 +387,7 @@ def init_project(root: Path, name: str, force: bool = False) -> list[Path]:
         "sources/items/three.txt": "third item\n",
         "graphs/demo.yaml": _DEMO_GRAPH,
         "graphs/fanout.yaml": _FANOUT_GRAPH,
+        "graphs/tagged.yaml": _TAGGED_GRAPH,
         "graphs/portrait.yaml": _PORTRAIT_GRAPH,
         "transformers/shout.yaml": _SHELL_TRANSFORMER.format(name="shout", op="upper"),
         "transformers/reverse.yaml": _SHELL_TRANSFORMER.format(

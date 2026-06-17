@@ -1,6 +1,6 @@
 """Content hashing, cache keys, deterministic paths, and the state file.
 
-Cache key (per DESIGN.md) is the SHA-256 of:
+Cache key is the SHA-256 of:
   1. the content hash of each input artifact (recursively resolved via file content)
   2. the full text of the transformer YAML
   3. for ComfyUI: the full text of the workflow JSON

@@ -596,6 +596,147 @@ def test_instance_hash_stable_and_distinct():
     assert len(h1) == 12
 
 
+# --------------------------------------------------------------------------- #
+# Tagged collections + filter_tag (Addendum 2)
+# --------------------------------------------------------------------------- #
+
+
+def test_input_ref_shorthand_equals_longform():
+    from smoketree.graph import InputRef
+    from smoketree.models import InputDecl
+
+    short = InputRef.parse("references[subject]")
+    long = InputRef.parse(InputDecl(node="references", filter_tag="subject"))
+    assert short == long
+    assert short.node_id == "references"
+    assert short.filter_tag == "subject"
+    assert short.output_name is None
+    # plain string still works
+    assert InputRef.parse("source").filter_tag is None
+
+
+def _tagged_refs_graph(project: Project, body: str) -> None:
+    for n in ("sub1", "sub2", "sty"):
+        _write(project.sources_dir / "refs" / f"{n}.txt", f"{n}\n")
+    (project.transformers_dir / "pair.yaml").write_text(_PAIR_TRANSFORMER)
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  references:\n"
+        "    type: collection\n"
+        "    sources:\n"
+        "      - {path: sources/refs/sub1.txt, tags: [subject, primary]}\n"
+        "      - {path: sources/refs/sub2.txt, tags: [subject]}\n"
+        "      - {path: sources/refs/sty.txt, tags: [style]}\n"
+        f"{body}"
+    )
+
+
+def test_filter_multi_fans_out(project: Project):
+    from smoketree.executor import run
+    from smoketree.cache import State
+
+    _tagged_refs_graph(
+        project,
+        "  prep: {type: transform, transformer: shout, "
+        "inputs: {input: 'references[subject]'}, expand: each}\n",
+    )
+    graph = load_graph(project, "g")
+    assert graph.is_collection("prep") is True
+    run(project, graph, take=0)
+    assert len(State.load(project, "g").nodes["prep"]) == 2  # two subject items
+
+
+def test_filter_single_is_scalar(project: Project):
+    from smoketree.executor import run
+
+    _tagged_refs_graph(
+        project,
+        "  prep: {type: transform, transformer: shout, "
+        "inputs: {input: 'references[style]'}}\n",  # 1 item -> scalar, no expand
+    )
+    graph = load_graph(project, "g")
+    assert graph.is_collection("prep") is False  # single match -> scalar
+    run(project, graph, take=0)
+    # flat (non-instance) cache layout for a scalar node
+    assert (cachelib.cache_node_dir(project, "g", "prep", 0) / "text.txt").exists()
+
+
+def test_filter_scalar_broadcasts_into_fanout(project: Project):
+    from smoketree.executor import run
+    from smoketree.cache import State
+
+    _tagged_refs_graph(
+        project,
+        "  prep: {type: transform, transformer: shout, "
+        "inputs: {input: 'references[subject]'}, expand: each}\n"
+        "  combo: {type: transform, transformer: pair, "
+        "inputs: {a: prep, b: 'references[style]'}, expand: each}\n",
+    )
+    graph = load_graph(project, "g")
+    run(project, graph, take=0)
+    # 2 subjects prepped, style broadcast -> 2 combo instances
+    assert len(State.load(project, "g").nodes["combo"]) == 2
+
+
+def test_filter_zero_match_errors(project: Project):
+    from smoketree.executor import run
+
+    _tagged_refs_graph(
+        project,
+        "  prep: {type: transform, transformer: shout, "
+        "inputs: {input: 'references[nope]'}}\n",
+    )
+    with pytest.raises(SmoketreeError, match="matched no items"):
+        run(project, load_graph(project, "g"), take=0)
+
+
+def test_filter_tag_on_noncollection_is_parse_error(project: Project):
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  src: {type: source, path: sources/hello.txt}\n"
+        "  p: {type: transform, transformer: shout, inputs: {input: 'src[x]'}}\n"
+    )
+    with pytest.raises(ValidationError, match="filter_tag"):
+        load_graph(project, "g")
+
+
+def test_collection_glob_and_sources_mutually_exclusive(project: Project):
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  c:\n"
+        "    type: collection\n"
+        "    glob: sources/*.txt\n"
+        "    sources: [{path: sources/hello.txt}]\n"
+        "  p: {type: transform, transformer: shout, inputs: {input: c}, expand: each}\n"
+    )
+    with pytest.raises(ValidationError, match="exactly one of 'glob' or 'sources'"):
+        load_graph(project, "g")
+
+
+def test_named_inputs_without_tagging(project: Project):
+    """Fixed named scalar source inputs feeding a multi-input transform."""
+    from smoketree.executor import run
+
+    _write(project.sources_dir / "x.txt", "x\n")
+    _write(project.sources_dir / "y.txt", "y\n")
+    (project.transformers_dir / "pair.yaml").write_text(_PAIR_TRANSFORMER)
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  sx: {type: source, path: sources/x.txt}\n"
+        "  sy: {type: source, path: sources/y.txt}\n"
+        "  joined: {type: transform, transformer: pair, inputs: {a: sx, b: sy}}\n"
+    )
+    graph = load_graph(project, "g")
+    assert graph.is_collection("joined") is False
+    run(project, graph, take=0)
+    out = (cachelib.cache_node_dir(project, "g", "joined", 0) / "text.txt").read_text()
+    assert out == "x\ny\n"
+
+
 def test_latent_media_type_validates(project: Project):
     (project.transformers_dir / "enc.yaml").write_text(
         "name: enc\n"
