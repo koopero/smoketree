@@ -34,14 +34,16 @@ to clear it.
 ## Core concepts
 
 - **Graph** (`graphs/<id>.yaml`): a named DAG. The `graph_id` is the filename stem.
-- **Node**: either a `source` (a raw file) or a `transform` (applies a transformer).
+- **Node**: a `source` (a raw file), a `collection` (a glob of files → many artifacts),
+  or a `transform` (applies a transformer).
 - **Input reference**: a transform node names its inputs by the *node id* that produces
   them — `inputs: { image: source }`. For a node with multiple outputs, use dot notation:
   `node_id.output_name`. Unqualified means the first declared output.
 - **Transformer** (`transformers/<name>.yaml`): how to execute one step. Declares typed
   `inputs` and `outputs`. Reusable across graphs.
-- **Media types**: `image | audio | video | text | data`. Connections are validated at
-  parse time — a `text` output cannot feed an `image` input (hard error).
+- **Media types**: `image | audio | video | text | data | latent`. Connections are
+  validated at parse time — a `text` output cannot feed an `image` input (hard error).
+  (`latent` is for ComfyUI `.latent` files passed between split workflow stages.)
 - **Caching**: a node is skipped if its inputs, transformer definition, and take are
   unchanged. Editing a transformer YAML invalidates that node and everything downstream.
 - **Seeds / takes**: every node execution gets a deterministic seed from
@@ -160,6 +162,53 @@ outputs:
     format: png
     collect: { node_id: "9", field: filename_prefix }
 ```
+
+---
+
+## Collections and fan-out
+
+A **collection node** resolves to many artifacts via a glob (evaluated at run time,
+ordered alphabetically; an empty glob is a hard error):
+
+```yaml
+characters:
+  type: collection
+  glob: sources/characters/*.jpg
+```
+
+A transform that consumes a collection input becomes a collection itself (it produces one
+artifact per execution), and **must declare an `expand` strategy**:
+
+| `expand` | Behaviour | Constraint |
+|----------|-----------|------------|
+| `each`    | one execution per item | exactly one collection input |
+| `zip`     | positional pairing `A[i]↔B[i]` | all collection inputs equal length (runtime) |
+| `product` | every combination | any number of collection inputs |
+
+```yaml
+controlnet:
+  type: transform
+  transformer: controlnet_prep
+  inputs: { image: characters }     # collection
+  expand: each                      # N executions
+
+generated:
+  type: transform
+  transformer: generate
+  inputs:
+    controlnet_image: controlnet    # collection (N)
+    pose: poses                     # collection (M)
+  expand: product                   # N×M executions
+```
+
+Rules (all hard errors): a transform with a collection input but no `expand`; an `expand`
+on a node with no collection inputs; `each` with more than one collection input.
+
+Each execution of a fanned-out node is an **instance**, identified by a hash of its input
+paths. Instances cache independently:
+`.smoketree/cache/{graph}/{node}/{instance_hash}/take_{n}/`, with a `.instance.json`
+sidecar recording which inputs produced it. Adding one source file rebuilds only the new
+combinations; everything else stays cached.
 
 ---
 

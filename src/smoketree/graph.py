@@ -28,6 +28,7 @@ _EXT_MEDIA: dict[str, MediaType] = {
     "mp4": "video", "mov": "video", "avi": "video", "mkv": "video", "webm": "video",
     "txt": "text", "md": "text",
     "json": "data", "yaml": "data", "yml": "data", "csv": "data",
+    "latent": "latent",
 }
 
 
@@ -57,6 +58,11 @@ class ResolvedGraph:
     transformers: dict[str, Transformer]  # node_id -> transformer (transform nodes only)
     input_refs: dict[str, dict[str, InputRef]]  # node_id -> input_name -> ref
     execution_order: list[str] = field(default_factory=list)
+    # node_id -> whether the node resolves to multiple artifacts (a collection)
+    collections: dict[str, bool] = field(default_factory=dict)
+
+    def is_collection(self, node_id: str) -> bool:
+        return self.collections.get(node_id, False)
 
     def dependencies(self, node_id: str) -> list[str]:
         """Direct upstream node ids that ``node_id`` consumes."""
@@ -103,7 +109,57 @@ def load_graph(project: Project, graph_id: str) -> ResolvedGraph:
         execution_order=execution_order,
     )
     _validate_media_types(graph)
+    _resolve_collections(graph)
     return graph
+
+
+def _resolve_collections(graph: ResolvedGraph) -> None:
+    """Mark which nodes resolve to multiple artifacts, and validate ``expand``.
+
+    A node is a collection if it is a ``collection`` node, or a transform that
+    consumes at least one collection input. Computed in topological order so a
+    node's inputs are already classified.
+    """
+    for node_id in graph.execution_order:
+        node = graph.nodes[node_id]
+        if node.type == "collection":
+            graph.collections[node_id] = True
+            continue
+        if node.type == "source":
+            graph.collections[node_id] = False
+            continue
+
+        collection_inputs = [
+            name
+            for name, ref in graph.input_refs[node_id].items()
+            if graph.is_collection(ref.node_id)
+        ]
+        graph.collections[node_id] = bool(collection_inputs)
+        _validate_expand(node_id, node, collection_inputs)
+
+
+def _validate_expand(
+    node_id: str, node: NodeDef, collection_inputs: list[str]
+) -> None:
+    if not collection_inputs:
+        if node.expand is not None:
+            raise ValidationError(
+                f"Node '{node_id}' declares expand='{node.expand}' but has no "
+                f"collection inputs. Omit 'expand'."
+            )
+        return
+    if node.expand is None:
+        raise ValidationError(
+            f"Node '{node_id}' consumes collection input(s) "
+            f"{', '.join(sorted(collection_inputs))} but does not declare 'expand' "
+            f"(one of: product, zip, each)."
+        )
+    if node.expand == "each" and len(collection_inputs) != 1:
+        raise ValidationError(
+            f"Node '{node_id}' uses expand='each' but has "
+            f"{len(collection_inputs)} collection inputs "
+            f"({', '.join(sorted(collection_inputs))}); 'each' requires exactly one."
+        )
 
 
 def _validate_node_shapes(
@@ -121,6 +177,15 @@ def _validate_node_shapes(
             if node.transformer or node.inputs:
                 raise ValidationError(
                     f"Source node '{node_id}' must not declare a transformer or inputs."
+                )
+        elif node.type == "collection":
+            if not node.glob:
+                raise ValidationError(
+                    f"Collection node '{node_id}' must declare a 'glob'."
+                )
+            if node.transformer or node.inputs or node.path:
+                raise ValidationError(
+                    f"Collection node '{node_id}' must declare only a 'glob'."
                 )
         else:  # transform
             if not node.transformer:
@@ -168,11 +233,11 @@ def _validate_references(
                     f"'{ref.node_id}'."
                 )
             producer = graph_def.nodes[ref.node_id]
-            if ref.output_name and producer.type == "source":
+            if ref.output_name and producer.type in ("source", "collection"):
                 raise ValidationError(
                     f"Node '{node_id}' input '{input_name}' uses dotted reference "
                     f"'{ref.node_id}.{ref.output_name}', but '{ref.node_id}' is a "
-                    f"source node with a single output."
+                    f"{producer.type} node with a single output."
                 )
 
 
@@ -224,6 +289,8 @@ def _producer_media(graph: ResolvedGraph, ref: InputRef) -> MediaType | None:
     producer = graph.nodes[ref.node_id]
     if producer.type == "source":
         return infer_media_from_path(Path(producer.path or ""))
+    if producer.type == "collection":
+        return infer_media_from_path(Path(producer.glob or ""))
     transformer = graph.transformers[ref.node_id]
     outputs = transformer.outputs
     if not outputs:

@@ -46,6 +46,18 @@ def compute_seed(graph_id: str, node_id: str, take: int) -> int:
     return int(digest, 16) % (2**32)
 
 
+def instance_hash(key: dict[str, str]) -> str:
+    """Short, readable hash of an expanded node's instance key (input paths).
+
+    The key is the mapping of input name -> producing artifact path that uniquely
+    identifies one execution within a fanned-out node.
+    """
+    h = hashlib.sha256()
+    for name in sorted(key):
+        h.update(f"{name}={key[name]}\x00".encode())
+    return h.hexdigest()[:12]
+
+
 def compute_cache_key(
     input_hashes: dict[str, str],
     transformer_text: str,
@@ -78,9 +90,25 @@ def scratch_node_dir(project: Project, graph_id: str, node_id: str, take: int) -
     return project.scratch_dir / graph_id / node_id / f"take_{take}"
 
 
-def output_node_dir(project: Project, graph_id: str, node_id: str, take: int) -> Path:
-    """Per-execution output dir, exposed to transformers as ``{dirs.output}``."""
-    return cache_node_dir(project, graph_id, node_id, take)
+def _instance_dir(base: Path, node_id: str, inst_hash: str | None, take: int) -> Path:
+    """Per-execution dir. Fanned-out nodes nest under their instance hash; plain
+    (single-instance) nodes use the flat ``take_{n}`` layout."""
+    node_dir = base / node_id
+    if inst_hash is not None:
+        node_dir = node_dir / inst_hash
+    return node_dir / f"take_{take}"
+
+
+def cache_instance_dir(
+    project: Project, graph_id: str, node_id: str, inst_hash: str | None, take: int
+) -> Path:
+    return _instance_dir(project.cache_dir / graph_id, node_id, inst_hash, take)
+
+
+def scratch_instance_dir(
+    project: Project, graph_id: str, node_id: str, inst_hash: str | None, take: int
+) -> Path:
+    return _instance_dir(project.scratch_dir / graph_id, node_id, inst_hash, take)
 
 
 # --------------------------------------------------------------------------- #
@@ -96,12 +124,17 @@ class NodeState:
 
 
 class State:
-    """The per-graph state file, recording last-successful input hashes."""
+    """The per-graph state file, recording last-successful input hashes.
+
+    State is keyed per node *and per instance* — a fanned-out node has one entry
+    per expanded execution. Plain nodes have a single instance entry.
+    """
 
     def __init__(self, project: Project, graph_id: str):
         self.project = project
         self.graph_id = graph_id
-        self.nodes: dict[str, NodeState] = {}
+        # node_id -> instance_hash -> NodeState
+        self.nodes: dict[str, dict[str, NodeState]] = {}
 
     @property
     def path(self) -> Path:
@@ -113,15 +146,24 @@ class State:
         if state.path.exists():
             data = json.loads(state.path.read_text())
             for node_id, raw in data.get("nodes", {}).items():
-                state.nodes[node_id] = NodeState(
-                    input_hash=raw["input_hash"],
-                    take=raw.get("take", 0),
-                    completed_at=raw.get("completed_at", ""),
-                )
+                instances = raw.get("instances", {})
+                state.nodes[node_id] = {
+                    inst: NodeState(
+                        input_hash=ns["input_hash"],
+                        take=ns.get("take", 0),
+                        completed_at=ns.get("completed_at", ""),
+                    )
+                    for inst, ns in instances.items()
+                }
         return state
 
-    def record(self, node_id: str, input_hash: str, take: int) -> None:
-        self.nodes[node_id] = NodeState(
+    def get(self, node_id: str, inst_hash: str) -> NodeState | None:
+        return self.nodes.get(node_id, {}).get(inst_hash)
+
+    def record(
+        self, node_id: str, inst_hash: str, input_hash: str, take: int
+    ) -> None:
+        self.nodes.setdefault(node_id, {})[inst_hash] = NodeState(
             input_hash=input_hash,
             take=take,
             completed_at=datetime.now(timezone.utc)
@@ -134,11 +176,16 @@ class State:
         data = {
             "nodes": {
                 node_id: {
-                    "input_hash": ns.input_hash,
-                    "take": ns.take,
-                    "completed_at": ns.completed_at,
+                    "instances": {
+                        inst: {
+                            "input_hash": ns.input_hash,
+                            "take": ns.take,
+                            "completed_at": ns.completed_at,
+                        }
+                        for inst, ns in instances.items()
+                    }
                 }
-                for node_id, ns in self.nodes.items()
+                for node_id, instances in self.nodes.items()
             }
         }
         self.path.write_text(json.dumps(data, indent=2) + "\n")

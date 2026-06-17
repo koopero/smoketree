@@ -74,6 +74,24 @@ nodes:
       input: reverse
 """
 
+_FANOUT_GRAPH = """\
+name: fanout
+
+# Demonstrates collection nodes + fan-out. `items` resolves to every matching file;
+# `shout` runs once per item (expand: each). See INSTRUCTIONS.md for product/zip.
+nodes:
+  items:
+    type: collection
+    glob: sources/items/*.txt
+
+  shout:
+    type: transform
+    transformer: shout
+    inputs:
+      input: items
+    expand: each
+"""
+
 _SHELL_TRANSFORMER = """\
 name: {name}
 type: shell
@@ -337,7 +355,11 @@ def init_project(root: Path, name: str, force: bool = False) -> list[Path]:
         ".gitignore": _GITIGNORE,
         ".env": _ENV,
         "sources/hello.txt": _HELLO,
+        "sources/items/one.txt": "first item\n",
+        "sources/items/two.txt": "second item\n",
+        "sources/items/three.txt": "third item\n",
         "graphs/demo.yaml": _DEMO_GRAPH,
+        "graphs/fanout.yaml": _FANOUT_GRAPH,
         "graphs/portrait.yaml": _PORTRAIT_GRAPH,
         "transformers/shout.yaml": _SHELL_TRANSFORMER.format(name="shout", op="upper"),
         "transformers/reverse.yaml": _SHELL_TRANSFORMER.format(

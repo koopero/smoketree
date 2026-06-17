@@ -145,11 +145,20 @@ def status(
             typer.echo(f"{graph_id}: no recorded runs")
             continue
         typer.secho(f"{graph_id}:", bold=True)
-        for node_id, ns in state.nodes.items():
-            typer.echo(
-                f"  {node_id:<16} take={ns.take}  {ns.completed_at}  "
-                f"hash={ns.input_hash[:12]}"
-            )
+        for node_id, instances in state.nodes.items():
+            if len(instances) == 1:
+                ns = next(iter(instances.values()))
+                typer.echo(
+                    f"  {node_id:<16} take={ns.take}  {ns.completed_at}  "
+                    f"hash={ns.input_hash[:12]}"
+                )
+            else:
+                typer.echo(f"  {node_id} ({len(instances)} instances)")
+                for inst_hash, ns in instances.items():
+                    typer.echo(
+                        f"    {inst_hash}  take={ns.take}  {ns.completed_at}  "
+                        f"hash={ns.input_hash[:12]}"
+                    )
 
 
 @app.command()
@@ -158,10 +167,10 @@ def inspect(
     node: str = typer.Argument(..., help="Node id."),
     take: int = typer.Option(0, "--take", help="Take index."),
 ) -> None:
-    """Inspect a node's scratch directory."""
+    """Inspect a node's scratch and cache directories (all takes/instances)."""
     project = _project()
-    scratch = cachelib.scratch_node_dir(project, graph, node, take)
-    cache = cachelib.cache_node_dir(project, graph, node, take)
+    scratch = project.scratch_dir / graph / node
+    cache = project.cache_dir / graph / node
     typer.secho(f"scratch: {scratch}", bold=True)
     _list_dir(scratch)
     typer.secho(f"cache:   {cache}", bold=True)

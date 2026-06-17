@@ -11,8 +11,10 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
-MediaType = Literal["image", "audio", "video", "text", "data"]
-MEDIA_TYPES: tuple[str, ...] = ("image", "audio", "video", "text", "data")
+MediaType = Literal["image", "audio", "video", "text", "data", "latent"]
+MEDIA_TYPES: tuple[str, ...] = ("image", "audio", "video", "text", "data", "latent")
+
+ExpandStrategy = Literal["product", "zip", "each"]
 
 
 # --------------------------------------------------------------------------- #
@@ -46,12 +48,16 @@ class NodeDef(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["source", "transform"]
+    type: Literal["source", "transform", "collection"]
     # source nodes:
     path: str | None = None
+    # collection nodes:
+    glob: str | None = None
     # transform nodes:
     transformer: str | None = None
     inputs: dict[str, str] = Field(default_factory=dict)
+    # fan-out strategy; required iff a transform consumes a collection input
+    expand: ExpandStrategy | None = None
 
 
 class GraphDef(BaseModel):

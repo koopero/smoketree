@@ -421,3 +421,198 @@ def test_take_changes_seed_and_dir(project: Project):
     assert cachelib.cache_node_dir(project, "demo", "shout", 2).exists()
     assert (cachelib.cache_node_dir(project, "demo", "shout", 0)
             != cachelib.cache_node_dir(project, "demo", "shout", 2))
+
+
+# --------------------------------------------------------------------------- #
+# Collections and fan-out
+# --------------------------------------------------------------------------- #
+
+
+def _write(path: Path, content: str = "") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+_PAIR_TRANSFORMER = (
+    "name: pair\n"
+    "type: shell\n"
+    "command: cat {inputs.a} {inputs.b} > {outputs.text}\n"
+    "inputs:\n"
+    "  a: {type: file, media: text}\n"
+    "  b: {type: file, media: text}\n"
+    "outputs:\n"
+    "  text: {type: file, media: text, format: txt}\n"
+)
+
+
+@pytest.fixture
+def collections_project(project: Project) -> Project:
+    for n in ("1", "2"):
+        _write(project.sources_dir / "a" / f"{n}.txt", f"a{n}\n")
+    for n in ("x", "y", "z"):
+        _write(project.sources_dir / "b" / f"{n}.txt", f"b{n}\n")
+    (project.transformers_dir / "pair.yaml").write_text(_PAIR_TRANSFORMER)
+    return project
+
+
+def test_collection_is_flagged_and_propagates(project: Project):
+    _write(project.sources_dir / "a" / "1.txt", "a1\n")
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  items: {type: collection, glob: sources/a/*.txt}\n"
+        "  up: {type: transform, transformer: shout, inputs: {input: items}, "
+        "expand: each}\n"
+    )
+    graph = load_graph(project, "g")
+    assert graph.is_collection("items") is True
+    assert graph.is_collection("up") is True  # consumes a collection
+
+
+def test_each_fanout_runs_per_item(project: Project):
+    from smoketree.executor import run
+    from smoketree.cache import State
+
+    for n in ("1", "2", "3"):
+        _write(project.sources_dir / "a" / f"{n}.txt", f"a{n}\n")
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  items: {type: collection, glob: sources/a/*.txt}\n"
+        "  up: {type: transform, transformer: shout, inputs: {input: items}, "
+        "expand: each}\n"
+    )
+    graph = load_graph(project, "g")
+    run(project, graph, take=0)
+    state = State.load(project, "g")
+    assert len(state.nodes["up"]) == 3  # one instance per item
+
+
+def test_product_fanout(collections_project: Project):
+    from smoketree.executor import run
+    from smoketree.cache import State
+
+    p = collections_project
+    (p.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  ca: {type: collection, glob: sources/a/*.txt}\n"
+        "  cb: {type: collection, glob: sources/b/*.txt}\n"
+        "  paired: {type: transform, transformer: pair, "
+        "inputs: {a: ca, b: cb}, expand: product}\n"
+    )
+    graph = load_graph(p, "g")
+    run(p, graph, take=0)
+    state = State.load(p, "g")
+    assert len(state.nodes["paired"]) == 6  # 2 x 3
+
+
+def test_zip_fanout_and_mismatch(collections_project: Project):
+    from smoketree.executor import run
+    from smoketree.cache import State
+
+    p = collections_project
+    # zip with equal lengths: a (2) zipped with a copy of a (2)
+    for n in ("1", "2"):
+        _write(p.sources_dir / "c" / f"{n}.txt", f"c{n}\n")
+    (p.graphs_dir / "ok.yaml").write_text(
+        "name: ok\n"
+        "nodes:\n"
+        "  ca: {type: collection, glob: sources/a/*.txt}\n"
+        "  cc: {type: collection, glob: sources/c/*.txt}\n"
+        "  z: {type: transform, transformer: pair, inputs: {a: ca, b: cc}, expand: zip}\n"
+    )
+    run(p, load_graph(p, "ok"), take=0)
+    assert len(State.load(p, "ok").nodes["z"]) == 2
+
+    # zip with unequal lengths -> runtime error
+    (p.graphs_dir / "bad.yaml").write_text(
+        "name: bad\n"
+        "nodes:\n"
+        "  ca: {type: collection, glob: sources/a/*.txt}\n"
+        "  cb: {type: collection, glob: sources/b/*.txt}\n"
+        "  z: {type: transform, transformer: pair, inputs: {a: ca, b: cb}, expand: zip}\n"
+    )
+    with pytest.raises(SmoketreeError, match="equal-length"):
+        run(p, load_graph(p, "bad"), take=0)
+
+
+def test_expand_required_when_collection_input(project: Project):
+    _write(project.sources_dir / "a" / "1.txt", "a1\n")
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  items: {type: collection, glob: sources/a/*.txt}\n"
+        "  up: {type: transform, transformer: shout, inputs: {input: items}}\n"
+    )
+    with pytest.raises(ValidationError, match="does not declare 'expand'"):
+        load_graph(project, "g")
+
+
+def test_expand_forbidden_without_collection(project: Project):
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  t: {type: source, path: sources/hello.txt}\n"
+        "  up: {type: transform, transformer: shout, inputs: {input: t}, expand: each}\n"
+    )
+    with pytest.raises(ValidationError, match="no collection inputs"):
+        load_graph(project, "g")
+
+
+def test_each_rejects_multiple_collections(collections_project: Project):
+    p = collections_project
+    (p.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  ca: {type: collection, glob: sources/a/*.txt}\n"
+        "  cb: {type: collection, glob: sources/b/*.txt}\n"
+        "  m: {type: transform, transformer: pair, inputs: {a: ca, b: cb}, expand: each}\n"
+    )
+    with pytest.raises(ValidationError, match="requires exactly one"):
+        load_graph(p, "g")
+
+
+def test_empty_glob_is_error(project: Project):
+    from smoketree.executor import run
+
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  items: {type: collection, glob: sources/none/*.txt}\n"
+        "  up: {type: transform, transformer: shout, inputs: {input: items}, "
+        "expand: each}\n"
+    )
+    with pytest.raises(SmoketreeError, match="matched no files"):
+        run(project, load_graph(project, "g"), take=0)
+
+
+def test_instance_hash_stable_and_distinct():
+    h1 = cachelib.instance_hash({"a": "/p/1.txt", "b": "/p/x.txt"})
+    h2 = cachelib.instance_hash({"b": "/p/x.txt", "a": "/p/1.txt"})  # order-independent
+    h3 = cachelib.instance_hash({"a": "/p/2.txt", "b": "/p/x.txt"})
+    assert h1 == h2
+    assert h1 != h3
+    assert len(h1) == 12
+
+
+def test_latent_media_type_validates(project: Project):
+    (project.transformers_dir / "enc.yaml").write_text(
+        "name: enc\n"
+        "type: comfyui\n"
+        "workflow: enc.json\n"
+        "inputs:\n"
+        "  image: {type: file, media: image, inject: {node_id: '4', field: image}}\n"
+        "outputs:\n"
+        "  latent: {type: file, media: latent, format: latent, "
+        "collect: {node_id: '8', field: filename_prefix}}\n"
+    )
+    (project.sources_dir / "pic.png").write_bytes(b"\x89PNG\r\n")
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  src: {type: source, path: sources/pic.png}\n"
+        "  enc: {type: transform, transformer: enc, inputs: {image: src}}\n"
+    )
+    graph = load_graph(project, "g")  # latent output validates without error
+    assert graph.transformers["enc"].outputs["latent"].media == "latent"
