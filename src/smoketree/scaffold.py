@@ -7,9 +7,15 @@ canonical ``portrait`` AI pipeline from the design.
 
 from __future__ import annotations
 
+from importlib import resources
 from pathlib import Path
 
 from .errors import SmoketreeError
+
+
+def _template(name: str) -> str:
+    """Read a packaged template file from ``smoketree/templates/``."""
+    return resources.files("smoketree").joinpath("templates", name).read_text()
 
 _SMOKETREE_YAML = """\
 name: {name}
@@ -327,6 +333,7 @@ def init_project(root: Path, name: str, force: bool = False) -> list[Path]:
 
     files: dict[str, str] = {
         "smoketree.yaml": _SMOKETREE_YAML.format(name=name),
+        "INSTRUCTIONS.md": _template("INSTRUCTIONS.md"),
         ".gitignore": _GITIGNORE,
         ".env": _ENV,
         "sources/hello.txt": _HELLO,

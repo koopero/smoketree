@@ -40,6 +40,12 @@ def project(tmp_path: Path) -> Project:
 # --------------------------------------------------------------------------- #
 
 
+def test_scaffold_writes_instructions(project: Project):
+    instructions = project.root / "INSTRUCTIONS.md"
+    assert instructions.exists()
+    assert "Smoketree project" in instructions.read_text()
+
+
 def test_env_substitution(monkeypatch):
     monkeypatch.setenv("FOO", "bar")
     assert substitute_env({"k": "${FOO}/x"}) == {"k": "bar/x"}
