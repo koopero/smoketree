@@ -1,0 +1,156 @@
+"""Pydantic models for project config, graphs, and transformers.
+
+These mirror the internal data model in DESIGN.md. Parsed YAML is validated into these
+shapes; runtime resolution (topological order, artifact paths) is layered on top in
+``graph.py`` and ``executor.py``.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Any, Literal, Union
+
+from pydantic import BaseModel, ConfigDict, Field
+
+MediaType = Literal["image", "audio", "video", "text", "data"]
+MEDIA_TYPES: tuple[str, ...] = ("image", "audio", "video", "text", "data")
+
+
+# --------------------------------------------------------------------------- #
+# Project config
+# --------------------------------------------------------------------------- #
+
+
+class Defaults(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    comfyui_url: str = "http://localhost:8188"
+    ollama_url: str = "http://localhost:11434"
+    take: int = 0
+
+
+class ProjectConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    defaults: Defaults = Field(default_factory=Defaults)
+    env: dict[str, str] = Field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- #
+# Graph definition
+# --------------------------------------------------------------------------- #
+
+
+class NodeDef(BaseModel):
+    """A node as declared in a graph YAML file (before resolution)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["source", "transform"]
+    # source nodes:
+    path: str | None = None
+    # transform nodes:
+    transformer: str | None = None
+    inputs: dict[str, str] = Field(default_factory=dict)
+
+
+class GraphDef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    nodes: dict[str, NodeDef]
+
+
+# --------------------------------------------------------------------------- #
+# Transformer definitions
+# --------------------------------------------------------------------------- #
+
+
+class ComfyInject(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str
+    field: str
+
+
+class ComfyCollect(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str
+    field: str
+
+
+class InputSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["file"] = "file"
+    media: MediaType
+    # comfyui-only: where to inject this input into the workflow JSON
+    inject: ComfyInject | None = None
+
+
+class OutputSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["file"] = "file"
+    media: MediaType
+    format: str | None = None
+    # comfyui-only: which workflow node produces this output
+    collect: ComfyCollect | None = None
+
+
+class _BaseTransformer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    inputs: dict[str, InputSpec] = Field(default_factory=dict)
+    outputs: dict[str, OutputSpec] = Field(default_factory=dict)
+
+
+class ShellTransformer(_BaseTransformer):
+    type: Literal["shell"]
+    command: str
+    env: dict[str, str] = Field(default_factory=dict)
+
+
+class ClaudeTransformer(_BaseTransformer):
+    type: Literal["claude"]
+    model: str = "claude-sonnet-4-6"
+    max_tokens: int = 1024
+    system: str | None = None
+    prompt: str
+
+
+class OllamaTransformer(_BaseTransformer):
+    type: Literal["ollama"]
+    model: str
+    system: str | None = None
+    prompt: str
+    # Passed through to Ollama's "options" (e.g. temperature, num_predict). The
+    # deterministic Smoketree seed is injected as options.seed unless overridden here.
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class ComfyUITransformer(_BaseTransformer):
+    type: Literal["comfyui"]
+    workflow: str
+
+
+class HTTPTransformer(_BaseTransformer):
+    """Generic HTTP request transformer (declared in DESIGN.md as future work)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["http"]
+
+
+Transformer = Annotated[
+    Union[
+        ShellTransformer,
+        ClaudeTransformer,
+        OllamaTransformer,
+        ComfyUITransformer,
+        HTTPTransformer,
+    ],
+    Field(discriminator="type"),
+]
