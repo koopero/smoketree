@@ -430,6 +430,15 @@ def test_comfyui_inject_text(tmp_path):
     assert workflow["6"]["inputs"]["text"] == "a cat"
 
 
+def test_comfyui_strips_annotation_keys():
+    from smoketree.backends.comfyui import _node_dict
+
+    wf = {"_comment": "docs", "6": {"class_type": "X", "inputs": {}}}
+    stripped = _node_dict(wf)
+    assert "_comment" not in stripped
+    assert stripped == {"6": {"class_type": "X", "inputs": {}}}
+
+
 def test_comfyui_seed_injection(tmp_path):
     tf = ComfyUITransformer(
         name="x",

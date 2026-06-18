@@ -33,7 +33,7 @@ class ComfyUIBackend(Backend):
             raise ExecutionError(
                 f"ComfyUI workflow not found: {workflow_path}."
             )
-        workflow = json.loads(workflow_path.read_text())
+        workflow = _node_dict(json.loads(workflow_path.read_text()))
 
         client = httpx.Client(base_url=base_url, timeout=30.0)
         client_id = str(uuid.uuid4())
@@ -164,6 +164,15 @@ class ComfyUIBackend(Backend):
         )
         resp.raise_for_status()
         return resp.content
+
+
+def _node_dict(workflow: dict) -> dict:
+    """Keep only node entries, dropping annotation keys (e.g. ``_comment``).
+
+    ComfyUI's /prompt treats every top-level key as a node and 500s on a non-node
+    value, so a documentation key like ``_comment`` would break submission.
+    """
+    return {k: v for k, v in workflow.items() if isinstance(v, dict)}
 
 
 def _http_detail(action: str, resp: httpx.Response) -> str:
