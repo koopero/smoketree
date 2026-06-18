@@ -156,6 +156,9 @@ class OllamaTransformer(_BaseTransformer):
     model: str
     system: str | None = None
     prompt: str
+    # Toggle reasoning for thinking-capable models. Set false so the whole token
+    # budget goes to the answer (thinking models otherwise return an empty response).
+    think: bool | None = None
     # Passed through to Ollama's "options" (e.g. temperature, num_predict). The
     # deterministic Smoketree seed is injected as options.seed unless overridden here.
     options: dict[str, Any] = Field(default_factory=dict)
@@ -164,6 +167,9 @@ class OllamaTransformer(_BaseTransformer):
 class ComfyUITransformer(_BaseTransformer):
     type: Literal["comfyui"]
     workflow: str
+    # Optional: inject the deterministic per-take seed into a workflow node (e.g. a
+    # KSampler's "seed" field) so different takes produce different generations.
+    seed_inject: ComfyInject | None = None
 
 
 class HTTPTransformer(_BaseTransformer):

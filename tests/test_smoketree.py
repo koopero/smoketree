@@ -285,6 +285,22 @@ def test_ollama_empty_response_fails(tmp_path, monkeypatch):
     assert not (tmp_path / "out.txt").exists()  # no output written on failure
 
 
+def test_ollama_think_param(tmp_path):
+    text_file = tmp_path / "in.txt"
+    text_file.write_text("x")
+    art = Artifact(path=text_file, media="text", format="txt", content_hash="h")
+
+    # omitted by default
+    tf = _ollama_tf("{inputs.text}", {"text": InputSpec(media="text")})
+    payload = OllamaBackend()._build_payload(_ctx(tmp_path, tf, {"text": art}))
+    assert "think" not in payload
+
+    # passed through when set
+    tf = _ollama_tf("{inputs.text}", {"text": InputSpec(media="text")}, think=False)
+    payload = OllamaBackend()._build_payload(_ctx(tmp_path, tf, {"text": art}))
+    assert payload["think"] is False
+
+
 def test_ollama_explicit_seed_preserved(tmp_path):
     text_file = tmp_path / "in.txt"
     text_file.write_text("x")
@@ -344,6 +360,39 @@ def test_comfyui_inject_text(tmp_path):
     workflow = {"6": {"class_type": "CLIPTextEncode", "inputs": {"text": "old"}}}
     ComfyUIBackend()._inject_inputs(_FakeClient(), workflow, ctx)
     assert workflow["6"]["inputs"]["text"] == "a cat"
+
+
+def test_comfyui_seed_injection(tmp_path):
+    tf = ComfyUITransformer(
+        name="x",
+        type="comfyui",
+        workflow="w.json",
+        seed_inject=ComfyInject(node_id="3", field="seed"),
+        inputs={},
+        outputs={
+            "image": OutputSpec(
+                media="image", format="png",
+                collect=ComfyCollect(node_id="9", field="filename_prefix"),
+            )
+        },
+    )
+    ctx = _ctx(tmp_path, tf, {})  # _ctx sets seed=1
+    workflow = {"3": {"class_type": "KSampler", "inputs": {"seed": 0}}}
+    ComfyUIBackend()._inject_inputs(_FakeClient(), workflow, ctx)
+    assert workflow["3"]["inputs"]["seed"] == ctx.seed == 1
+
+
+def test_comfyui_seed_injection_unknown_node(tmp_path):
+    tf = ComfyUITransformer(
+        name="x", type="comfyui", workflow="w.json",
+        seed_inject=ComfyInject(node_id="99", field="seed"),
+        inputs={},
+        outputs={"image": OutputSpec(media="image", format="png",
+            collect=ComfyCollect(node_id="9", field="filename_prefix"))},
+    )
+    ctx = _ctx(tmp_path, tf, {})
+    with pytest.raises(SmoketreeError, match="seed_inject"):
+        ComfyUIBackend()._inject_inputs(_FakeClient(), {"3": {"inputs": {}}}, ctx)
 
 
 def test_comfyui_collect_outputs(tmp_path):

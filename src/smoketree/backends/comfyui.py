@@ -52,6 +52,17 @@ class ComfyUIBackend(Backend):
     ) -> None:
         transformer = ctx.transformer
         assert isinstance(transformer, ComfyUITransformer)
+
+        seed_inject = transformer.seed_inject
+        if seed_inject is not None:
+            node = workflow.get(seed_inject.node_id)
+            if node is None or "inputs" not in node:
+                raise ExecutionError(
+                    f"Workflow has no node '{seed_inject.node_id}' with inputs "
+                    f"(for seed_inject)."
+                )
+            node["inputs"][seed_inject.field] = ctx.seed
+
         for name, spec in transformer.inputs.items():
             inject = spec.inject
             if inject is None:
@@ -79,12 +90,14 @@ class ComfyUIBackend(Backend):
     def _upload_image(self, client: httpx.Client, path: Path) -> str:
         files = {"image": (path.name, path.read_bytes())}
         resp = client.post("/upload/image", files=files, data={"overwrite": "true"})
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise ExecutionError(_http_detail(f"upload image '{path.name}'", resp))
         return resp.json()["name"]
 
     def _submit(self, client: httpx.Client, workflow: dict, client_id: str) -> str:
         resp = client.post("/prompt", json={"prompt": workflow, "client_id": client_id})
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise ExecutionError(_http_detail("submit prompt", resp))
         body = resp.json()
         prompt_id = body.get("prompt_id")
         if not prompt_id:
@@ -146,3 +159,25 @@ class ComfyUIBackend(Backend):
         )
         resp.raise_for_status()
         return resp.content
+
+
+def _http_detail(action: str, resp: httpx.Response) -> str:
+    """Build an error including ComfyUI's response body.
+
+    ComfyUI returns workflow validation failures as JSON with ``error`` and
+    ``node_errors`` keys; surfacing them is what makes a 4xx/5xx actionable.
+    """
+    detail = resp.text
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and ("error" in data or "node_errors" in data):
+        parts = []
+        if data.get("error"):
+            parts.append(json.dumps(data["error"], indent=2))
+        if data.get("node_errors"):
+            parts.append("node_errors:\n" + json.dumps(data["node_errors"], indent=2))
+        detail = "\n".join(parts)
+    detail = (detail or "").strip()[:2000]
+    return f"ComfyUI failed to {action} ({resp.status_code}):\n{detail}"

@@ -78,6 +78,8 @@ class OllamaBackend(Backend):
         }
         if transformer.system:
             payload["system"] = transformer.system
+        if transformer.think is not None:
+            payload["think"] = transformer.think
         if image_paths:
             payload["images"] = [_b64(p) for p in image_paths]
         return payload
