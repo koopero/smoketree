@@ -19,7 +19,9 @@ class ExecutionContext:
     graph_id: str
     node_id: str
     transformer: Transformer
-    inputs: dict[str, Artifact]  # input_name -> resolved upstream artifact
+    # input_name -> resolved upstream artifact, or a list of artifacts for a grouped
+    # (multi-file) collection input
+    inputs: "dict[str, Artifact | list[Artifact]]"
     output_targets: dict[str, Path]  # output_name -> target path (in cache/output dir)
     scratch_dir: Path
     output_dir: Path

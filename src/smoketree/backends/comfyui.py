@@ -70,6 +70,11 @@ class ComfyUIBackend(Backend):
                     f"ComfyUI input '{name}' is missing an 'inject' spec."
                 )
             artifact = ctx.inputs[name]
+            if isinstance(artifact, list):
+                raise ExecutionError(
+                    f"ComfyUI input '{name}' received a multi-file (grouped) input; "
+                    f"ComfyUI injection supports a single file per input."
+                )
             node = workflow.get(inject.node_id)
             if node is None or "inputs" not in node:
                 raise ExecutionError(

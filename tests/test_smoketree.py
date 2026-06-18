@@ -706,6 +706,104 @@ def test_instance_hash_stable_and_distinct():
 
 
 # --------------------------------------------------------------------------- #
+# Grouped collections + multi-file inputs
+# --------------------------------------------------------------------------- #
+
+
+_CATGROUP_TRANSFORMER = (
+    "name: catgroup\n"
+    "type: shell\n"
+    "command: cat {inputs.group} > {outputs.text}\n"
+    "inputs:\n  group: {type: file, media: text}\n"
+    "outputs:\n  text: {type: file, media: text, format: txt}\n"
+)
+
+_GROUPED_GRAPH = (
+    "name: g\n"
+    "nodes:\n"
+    "  items: {type: collection, glob: 'sources/g/*/*.txt', group_by: parent}\n"
+    "  combine: {type: transform, transformer: catgroup, "
+    "inputs: {group: items}, expand: each}\n"
+)
+
+
+@pytest.fixture
+def grouped_project(project: Project) -> Project:
+    _write(project.sources_dir / "g" / "alpha" / "1.txt", "a-one\n")
+    _write(project.sources_dir / "g" / "alpha" / "2.txt", "a-two\n")
+    _write(project.sources_dir / "g" / "beta" / "3.txt", "b-three\n")
+    (project.transformers_dir / "catgroup.yaml").write_text(_CATGROUP_TRANSFORMER)
+    (project.graphs_dir / "g.yaml").write_text(_GROUPED_GRAPH)
+    return project
+
+
+def test_group_by_requires_glob(project: Project):
+    (project.graphs_dir / "bad.yaml").write_text(
+        "name: bad\n"
+        "nodes:\n"
+        "  c: {type: collection, sources: [{path: sources/hello.txt}], group_by: parent}\n"
+        "  t: {type: transform, transformer: shout, inputs: {input: c}, expand: each}\n"
+    )
+    with pytest.raises(ValidationError, match="group_by"):
+        load_graph(project, "bad")
+
+
+def test_grouped_one_instance_per_dir(grouped_project: Project):
+    from smoketree.executor import run
+    from smoketree.cache import State
+
+    graph = load_graph(grouped_project, "g")
+    assert graph.is_collection("combine") is True
+    run(grouped_project, graph, take=0)
+    # one instance per subdirectory, not per file (3 files -> 2 groups)
+    assert len(State.load(grouped_project, "g").nodes["combine"]) == 2
+
+
+def test_grouped_input_concatenates_whole_group(grouped_project: Project):
+    from smoketree.executor import run
+
+    graph = load_graph(grouped_project, "g")
+    run(grouped_project, graph, take=0)
+    # the 'alpha' instance should have cat'd both alpha files (multi-file input)
+    outs = list(
+        (grouped_project.cache_dir / "g" / "combine").glob("*/take_0/text.txt")
+    )
+    contents = sorted(p.read_text() for p in outs)
+    assert "a-one\na-two\n" in contents          # group of 2 files combined
+    assert "b-three\n" in contents               # group of 1 file
+
+
+def test_grouped_cache_is_per_group(grouped_project: Project):
+    from smoketree.executor import run
+
+    graph = load_graph(grouped_project, "g")
+    run(grouped_project, graph, take=0)
+
+    # change one file in the 'alpha' group; only that group should rebuild
+    (grouped_project.sources_dir / "g" / "alpha" / "2.txt").write_text("a-two-EDIT\n")
+    lines: list[str] = []
+    run(grouped_project, graph, take=0, report=lines.append)
+    runs = [ln for ln in lines if ln.startswith("[RUN ]") and "combine" in ln]
+    skips = [ln for ln in lines if ln.startswith("[SKIP]") and "combine" in ln]
+    assert len(runs) == 1  # only alpha rebuilds
+    assert len(skips) == 1  # beta stays cached
+
+
+def test_build_prompt_multi_image(tmp_path):
+    from smoketree.backends._prompt import build_prompt
+
+    a = tmp_path / "a.png"; a.write_bytes(b"\x89PNG\r\n")
+    b = tmp_path / "b.png"; b.write_bytes(b"\x89PNG\r\n")
+    arts = [
+        Artifact(path=a, media="image", format="png", content_hash="1"),
+        Artifact(path=b, media="image", format="png", content_hash="2"),
+    ]
+    text, images = build_prompt("look: {inputs.imgs}", {"imgs": arts})
+    assert len(images) == 2  # whole group attached
+    assert images == [a, b]
+
+
+# --------------------------------------------------------------------------- #
 # Tagged collections + filter_tag (Addendum 2)
 # --------------------------------------------------------------------------- #
 

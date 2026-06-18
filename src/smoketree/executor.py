@@ -35,15 +35,31 @@ class PlanEntry:
     reason: str
 
 
+# An input binding is either a single artifact (a flat collection item or scalar) or a
+# list of artifacts (a grouped collection item — the whole group of files).
+InputBinding = "Artifact | list[Artifact]"
+
+
+def _binding_artifacts(value) -> list[Artifact]:
+    return value if isinstance(value, list) else [value]
+
+
 @dataclass
 class Instance:
-    """One execution of a node: the resolved input artifacts that produced it."""
+    """One execution of a node: the resolved input bindings that produced it.
 
-    inputs: dict[str, Artifact]
+    A binding is a single :class:`Artifact`, or a list of artifacts when the input is a
+    grouped (multi-file) collection item.
+    """
+
+    inputs: "dict[str, Artifact | list[Artifact]]"
 
     @property
     def key(self) -> dict[str, str]:
-        return {name: str(art.path) for name, art in self.inputs.items()}
+        return {
+            name: "\x1f".join(str(a.path) for a in _binding_artifacts(val))
+            for name, val in self.inputs.items()
+        }
 
     @property
     def hash(self) -> str:
@@ -52,7 +68,14 @@ class Instance:
     def label(self, node_id: str) -> str:
         if not self.inputs:
             return node_id
-        return "|".join(_artifact_token(a.path) for _, a in sorted(self.inputs.items()))
+        tokens: list[str] = []
+        for _, val in sorted(self.inputs.items()):
+            if isinstance(val, list):
+                # a group — label by its common parent dir (e.g. the city name)
+                tokens.append(val[0].path.parent.name if val else "empty")
+            else:
+                tokens.append(_artifact_token(val.path))
+        return "|".join(tokens)
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +215,48 @@ class Resolver:
                 )
         return None
 
+    def produced_items(self, ref: InputRef) -> list:
+        """The fan-out units of a producer: one per collection item.
+
+        For a grouped collection each unit is a list of artifacts (the group); for a flat
+        collection / source / transform each unit is a single artifact.
+        """
+        producer = self.graph.nodes[ref.node_id]
+        if producer.type == "collection" and producer.group_by:
+            return self._grouped_items(ref.node_id)
+        return self.produced_artifacts(
+            ref.node_id, _ref_output(self.graph, ref), ref.filter_tag
+        )
+
+    def _grouped_items(self, node_id: str) -> list[list[Artifact]]:
+        node = self.graph.nodes[node_id]
+        files = sorted(
+            p for p in self.project.root.glob(node.glob or "") if p.is_file()
+        )
+        groups: dict[str, list[Artifact]] = {}
+        for p in files:
+            key = p.parent.name  # group_by == "parent"
+            groups.setdefault(key, []).append(
+                Artifact(
+                    path=p.resolve(),
+                    media=infer_media_from_path(p) or "data",
+                    format=p.suffix.lstrip(".").lower() or None,
+                    content_hash=cachelib.hash_file(p),
+                )
+            )
+        if not groups:
+            raise ExecutionError(
+                f"Collection node '{node_id}' glob '{node.glob}' matched no files."
+            )
+        return [groups[key] for key in sorted(groups)]
+
+    def collection_size(self, node_id: str) -> tuple[int, str]:
+        """(count, unit) for a collection node, for plan/run reporting."""
+        node = self.graph.nodes[node_id]
+        if node.group_by:
+            return len(self._grouped_items(node_id)), "groups"
+        return len(self._filter_collection(node_id, None)), "files"
+
     def transform_instances(self, node_id: str) -> list[Instance]:
         if node_id in self._instances:
             return self._instances[node_id]
@@ -201,16 +266,19 @@ class Resolver:
 
     def _transform_instances(self, node_id: str) -> list[Instance]:
         refs = self.graph.input_refs.get(node_id, {})
-        input_lists = {
-            name: self.produced_artifacts(
-                ref.node_id, _ref_output(self.graph, ref), ref.filter_tag
-            )
-            for name, ref in refs.items()
-        }
         coll_names = self.graph.collection_inputs.get(node_id, set())
         collection_inputs = [name for name in refs if name in coll_names]
-        singletons = {
-            name: input_lists[name][0]
+
+        # Collection inputs contribute fan-out items (single artifact, or a group list);
+        # singleton inputs each resolve to a single artifact.
+        input_items: dict[str, list] = {
+            name: self.produced_items(refs[name]) for name in collection_inputs
+        }
+        singletons: dict[str, Artifact] = {
+            name: self.produced_artifacts(
+                refs[name].node_id, _ref_output(self.graph, refs[name]),
+                refs[name].filter_tag,
+            )[0]
             for name in refs
             if name not in coll_names
         }
@@ -218,10 +286,7 @@ class Resolver:
             return [Instance(inputs=dict(singletons))]
 
         combos = _combine(
-            node_id,
-            self.graph.nodes[node_id].expand,
-            collection_inputs,
-            input_lists,
+            node_id, self.graph.nodes[node_id].expand, collection_inputs, input_items
         )
         return [Instance(inputs={**singletons, **combo}) for combo in combos]
 
@@ -230,8 +295,8 @@ def _combine(
     node_id: str,
     expand: str | None,
     collection_inputs: list[str],
-    input_lists: dict[str, list[Artifact]],
-) -> list[dict[str, Artifact]]:
+    input_lists: dict[str, list],
+) -> list[dict]:
     if expand == "each":
         only = collection_inputs[0]
         return [{only: art} for art in input_lists[only]]
@@ -290,10 +355,13 @@ def compute_node_cache_key(
     project: Project,
     graph: ResolvedGraph,
     node_id: str,
-    inputs: dict[str, Artifact],
+    inputs: "dict[str, Artifact | list[Artifact]]",
     take: int,
 ) -> str:
-    input_hashes = {name: art.content_hash for name, art in inputs.items()}
+    input_hashes = {
+        name: "+".join(a.content_hash for a in _binding_artifacts(val))
+        for name, val in inputs.items()
+    }
     return cachelib.compute_cache_key(
         input_hashes=input_hashes,
         transformer_text=_transformer_text(project, node_id, graph),
@@ -347,8 +415,8 @@ def compute_plan(
             continue
         if node.type == "collection":
             try:
-                n = len(resolver.produced_artifacts(node_id, ""))
-                entries.append(PlanEntry(node_id, "SKIP", f"collection, {n} files"))
+                n, unit = resolver.collection_size(node_id)
+                entries.append(PlanEntry(node_id, "SKIP", f"collection, {n} {unit}"))
             except SmoketreeError:
                 entries.append(PlanEntry(node_id, "PENDING", "glob matched no files"))
             continue
@@ -436,8 +504,8 @@ def run(
             report(f"[SKIP]  {node_id:<16}(source)")
             continue
         if node.type == "collection":
-            n = len(resolver.produced_artifacts(node_id, ""))
-            report(f"[SKIP]  {node_id:<16}(collection, {n} files)")
+            n, unit = resolver.collection_size(node_id)
+            report(f"[SKIP]  {node_id:<16}(collection, {n} {unit})")
             continue
 
         instances = resolver.transform_instances(node_id)
@@ -537,18 +605,26 @@ def _write_instance_sidecar(
     inst: Instance,
     take: int,
 ) -> None:
-    """Write ``.instance.json`` recording the instance key for human inspection."""
+    """Write ``.instance.json`` recording the instance key for human inspection.
+
+    A single-file input records a path string; a grouped (multi-file) input records the
+    list of paths (relative to the project root where possible).
+    """
     inst_dir = (
         cachelib.cache_instance_dir(project, graph.id, node_id, inst.hash, take).parent
     )
     inst_dir.mkdir(parents=True, exist_ok=True)
-    rel: dict[str, str] = {}
-    for name, path_str in inst.key.items():
-        path = Path(path_str)
+
+    def _rel(path: Path) -> str:
         try:
-            rel[name] = str(path.relative_to(project.root))
+            return str(path.relative_to(project.root))
         except ValueError:
-            rel[name] = path_str
+            return str(path)
+
+    rel: dict[str, object] = {}
+    for name, val in inst.inputs.items():
+        paths = [_rel(a.path) for a in _binding_artifacts(val)]
+        rel[name] = paths if isinstance(val, list) else paths[0]
     (inst_dir / ".instance.json").write_text(
         json.dumps({"inputs": rel}, indent=2) + "\n"
     )

@@ -77,6 +77,9 @@ class NodeDef(BaseModel):
     # collection nodes (exactly one of glob / sources):
     glob: str | None = None
     sources: list[CollectionSource] | None = None
+    # collection nodes (glob only): group matched files into one item per subdirectory,
+    # so a consuming transform runs once per group with the whole group as a multi-file input
+    group_by: Literal["parent"] | None = None
     # transform nodes:
     transformer: str | None = None
     inputs: dict[str, InputValue] = Field(default_factory=dict)

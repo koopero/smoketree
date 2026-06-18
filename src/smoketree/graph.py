@@ -228,6 +228,11 @@ def _validate_node_shapes(
                     f"Collection node '{node_id}' must declare only 'glob' or "
                     f"'sources'."
                 )
+            if node.group_by and not node.glob:
+                raise ValidationError(
+                    f"Collection node '{node_id}' uses 'group_by' but has no 'glob' "
+                    f"(group_by groups glob matches by subdirectory)."
+                )
         else:  # transform
             if not node.transformer:
                 raise ValidationError(

@@ -37,8 +37,10 @@ class ShellBackend(Backend):
             "node_id": ctx.node_id,
             "graph_id": ctx.graph_id,
         }
-        for name, artifact in ctx.inputs.items():
-            mapping[f"inputs.{name}"] = str(artifact.path)
+        for name, value in ctx.inputs.items():
+            # a grouped (multi-file) input expands to its space-separated paths
+            artifacts = value if isinstance(value, list) else [value]
+            mapping[f"inputs.{name}"] = " ".join(str(a.path) for a in artifacts)
         for name, target in ctx.output_targets.items():
             mapping[f"outputs.{name}"] = str(target)
 
