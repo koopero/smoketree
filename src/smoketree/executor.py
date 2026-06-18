@@ -496,6 +496,7 @@ def run(
     )
     resolver = Resolver(project, graph, take)
     state = State.load(project, graph.id)
+    exported = _exported_nodes(graph, order)
 
     for node_id in order:
         node = graph.nodes[node_id]
@@ -510,6 +511,7 @@ def run(
 
         instances = resolver.transform_instances(node_id)
         collection = graph.is_collection(node_id)
+        fresh_links: set[Path] = set()
         for inst in instances:
             col = (
                 f"{node_id} · {inst.label(node_id)}  "
@@ -519,28 +521,34 @@ def run(
             key = compute_node_cache_key(project, graph, node_id, inst.inputs, take)
             inst_hash = inst.hash if collection else None
 
-            if (
+            cached = (
                 not force
                 and (rec := state.get(node_id, inst.hash)) is not None
                 and rec.input_hash == key
                 and _instance_outputs_present(project, graph, node_id, inst_hash, take)
-            ):
+            )
+            if cached:
                 report(f"[SKIP]  {col}(cached)")
-                continue
+            else:
+                report(f"[RUN ]  {col}...")
+                started = time.monotonic()
+                produced = _execute_instance(project, graph, node_id, inst, take)
+                elapsed = time.monotonic() - started
+                _validate_outputs(graph, node_id, produced, report)
+                if collection:
+                    _write_instance_sidecar(project, graph, node_id, inst, take)
+                state.record(node_id, inst.hash, key, take)
+                state.save()
+                report(f"[DONE]  {col}({elapsed:.1f}s)")
 
-            report(f"[RUN ]  {col}...")
-            started = time.monotonic()
-            produced = _execute_instance(project, graph, node_id, inst, take)
-            elapsed = time.monotonic() - started
+            # Export this instance immediately so outputs/ fills in as the run proceeds.
+            if node_id in exported:
+                link = _link_instance(project, graph, node_id, inst, take)
+                if link is not None:
+                    fresh_links.add(link)
 
-            _validate_outputs(graph, node_id, produced, report)
-            if collection:
-                _write_instance_sidecar(project, graph, node_id, inst, take)
-            state.record(node_id, inst.hash, key, take)
-            state.save()
-            report(f"[DONE]  {col}({elapsed:.1f}s)")
-
-    _update_output_links(project, graph, resolver, take, order, report)
+        if node_id in exported:
+            _prune_stale_links(project, graph.id, node_id, fresh_links)
 
 
 def _execute_instance(
@@ -656,54 +664,43 @@ def _reset_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _update_output_links(
-    project: Project,
-    graph: ResolvedGraph,
-    resolver: Resolver,
-    take: int,
-    order: list[str],
-    report: Reporter,
-) -> None:
-    """Symlink (or copy) terminal-node outputs into ``outputs/``.
-
-    A fanned-out terminal node contributes one link per instance, suffixed with the
-    instance hash to keep names unique.
-    """
+def _exported_nodes(graph: ResolvedGraph, order: list[str]) -> set[str]:
+    """Nodes whose outputs go to outputs/: terminal transforms + `output: true`."""
     consumed = {
         ref.node_id for refs in graph.input_refs.values() for ref in refs.values()
     }
-    # Export terminal transforms by default, plus any node flagged `output: true`.
-    exported = [
+    return {
         node_id
         for node_id in order
         if graph.nodes[node_id].type == "transform"
         and (node_id not in consumed or graph.nodes[node_id].output)
-    ]
-    if not exported:
-        return
-    project.outputs_dir.mkdir(parents=True, exist_ok=True)
+    }
 
-    for node_id in exported:
-        transformer = graph.transformers[node_id]
-        if not transformer.outputs:
-            continue
-        first_output = next(iter(transformer.outputs))
-        collection = graph.is_collection(node_id)
-        try:
-            sources = resolver.produced_artifacts(node_id, first_output)
-        except SmoketreeError:
-            continue
-        fresh: set[Path] = set()
-        for art in sources:
-            ext = art.path.suffix
-            if collection:
-                tag = art.path.parent.parent.name  # the instance hash dir
-                link = project.outputs_dir / f"{graph.id}__{node_id}__{tag}{ext}"
-            else:
-                link = project.outputs_dir / f"{graph.id}__{node_id}{ext}"
-            _link_or_copy(art.path, link)
-            fresh.add(link)
-        _prune_stale_links(project, graph.id, node_id, fresh)
+
+def _link_instance(
+    project: Project, graph: ResolvedGraph, node_id: str, inst: Instance, take: int
+) -> Path | None:
+    """Link one instance's first output into outputs/ (single name, or hash-suffixed
+    for a fanned-out node). Returns the link path, or None if nothing is there yet."""
+    transformer = graph.transformers[node_id]
+    if not transformer.outputs:
+        return None
+    first_output = next(iter(transformer.outputs))
+    collection = graph.is_collection(node_id)
+    inst_hash = inst.hash if collection else None
+    node_dir = cachelib.cache_instance_dir(project, graph.id, node_id, inst_hash, take)
+    matches = sorted(node_dir.glob(f"{first_output}.*"))
+    if not matches:
+        return None
+    source = matches[0]
+    ext = source.suffix
+    project.outputs_dir.mkdir(parents=True, exist_ok=True)
+    if collection:
+        link = project.outputs_dir / f"{graph.id}__{node_id}__{inst.hash}{ext}"
+    else:
+        link = project.outputs_dir / f"{graph.id}__{node_id}{ext}"
+    _link_or_copy(source, link)
+    return link
 
 
 def _prune_stale_links(

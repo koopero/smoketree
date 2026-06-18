@@ -562,6 +562,30 @@ def test_output_symlink_created(project: Project):
     assert link.exists()
 
 
+def test_outputs_written_incrementally(project: Project):
+    """An exported node's output is linked as soon as it's produced — before a later
+    node (here, a failing one) runs."""
+    from smoketree.executor import run
+
+    (project.transformers_dir / "boom.yaml").write_text(
+        "name: boom\ntype: shell\ncommand: 'false'\n"
+        "inputs:\n  input: {type: file, media: text}\n"
+        "outputs:\n  text: {type: file, media: text, format: txt}\n"
+    )
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  t: {type: source, path: sources/hello.txt}\n"
+        "  a: {type: transform, transformer: shout, output: true, inputs: {input: t}}\n"
+        "  b: {type: transform, transformer: boom, inputs: {input: a}}\n"
+    )
+    graph = load_graph(project, "g")
+    with pytest.raises(SmoketreeError):
+        run(project, graph, take=0)
+    # `a` was exported before `b` failed
+    assert (project.outputs_dir / "g__a.txt").exists()
+
+
 def test_stale_output_links_pruned(project: Project):
     from smoketree.executor import run
 
