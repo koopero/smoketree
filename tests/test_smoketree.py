@@ -890,6 +890,34 @@ def test_materialize_edit_propagates_downstream(materialize_project: Project):
     assert derived.read_text() == "EDITED CONTENT\n"
 
 
+def test_materialize_writes_instance_sidecar(project: Project):
+    """A fanned-out materialize node records which inputs each owned artifact came from."""
+    import json as _json
+
+    from smoketree.executor import run
+
+    for n in ("a", "b"):
+        _write(project.sources_dir / "refs" / f"{n}.txt", f"{n}\n")
+    (project.transformers_dir / "gen_from.yaml").write_text(
+        "name: gen_from\ntype: shell\n"
+        "command: cp {inputs.ref} {outputs.doc}\n"
+        "inputs:\n  ref: {type: file, media: text}\n"
+        "outputs:\n  doc: {type: file, media: text, format: txt}\n"
+    )
+    (project.graphs_dir / "g.yaml").write_text(
+        "name: g\n"
+        "nodes:\n"
+        "  refs: {type: collection, glob: 'sources/refs/*.txt'}\n"
+        "  asset: {type: transform, transformer: gen_from, materialize: true, "
+        "expand: each, inputs: {ref: refs}}\n"
+    )
+    run(project, load_graph(project, "g"), take=0)
+    sidecars = list((project.scenes_dir / "g" / "asset").glob("*/.instance.json"))
+    assert len(sidecars) == 2
+    inputs = [_json.loads(s.read_text())["inputs"]["ref"] for s in sidecars]
+    assert sorted(inputs) == ["sources/refs/a.txt", "sources/refs/b.txt"]
+
+
 def test_materialize_force_regenerates(materialize_project: Project):
     from smoketree.executor import run
 

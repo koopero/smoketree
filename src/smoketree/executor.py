@@ -574,7 +574,13 @@ def run(
                     elapsed = time.monotonic() - started
                     _validate_outputs(graph, node_id, produced, report)
                     if collection:
-                        _write_instance_sidecar(project, graph, node_id, inst, take)
+                        _write_instance_sidecar(
+                            project,
+                            inst,
+                            cachelib.cache_instance_dir(
+                                project, graph.id, node_id, inst_hash, take
+                            ).parent,
+                        )
                     state.record(node_id, inst.hash, key, take)
                     state.save()
                     report(f"[DONE]  {col}({elapsed:.1f}s)")
@@ -646,22 +652,13 @@ def _execute_instance(
     return produced
 
 
-def _write_instance_sidecar(
-    project: Project,
-    graph: ResolvedGraph,
-    node_id: str,
-    inst: Instance,
-    take: int,
-) -> None:
-    """Write ``.instance.json`` recording the instance key for human inspection.
+def _write_instance_sidecar(project: Project, inst: Instance, dest_dir: Path) -> None:
+    """Write ``.instance.json`` into ``dest_dir`` recording the instance's inputs.
 
     A single-file input records a path string; a grouped (multi-file) input records the
     list of paths (relative to the project root where possible).
     """
-    inst_dir = (
-        cachelib.cache_instance_dir(project, graph.id, node_id, inst.hash, take).parent
-    )
-    inst_dir.mkdir(parents=True, exist_ok=True)
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
     def _rel(path: Path) -> str:
         try:
@@ -673,7 +670,7 @@ def _write_instance_sidecar(
     for name, val in inst.inputs.items():
         paths = [_rel(a.path) for a in _binding_artifacts(val)]
         rel[name] = paths if isinstance(val, list) else paths[0]
-    (inst_dir / ".instance.json").write_text(
+    (dest_dir / ".instance.json").write_text(
         json.dumps({"inputs": rel}, indent=2) + "\n"
     )
 
@@ -741,6 +738,9 @@ def _run_materialize(
     produced = _execute_instance(project, graph, node_id, inst, take, output_dir=mdir)
     elapsed = time.monotonic() - started
     _validate_outputs(graph, node_id, produced, report)
+    # record which inputs this owned artifact was generated from (so you can tell which
+    # scene/{hash} is which city x kaiju without opening it)
+    _write_instance_sidecar(project, inst, mdir)
     state.record(node_id, inst.hash, key, take)
     state.save()
     report(f"[GEN ]  {col}({elapsed:.1f}s)")
