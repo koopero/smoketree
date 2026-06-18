@@ -430,6 +430,30 @@ def test_comfyui_inject_text(tmp_path):
     assert workflow["6"]["inputs"]["text"] == "a cat"
 
 
+def test_comfyui_upload_is_content_addressed(tmp_path):
+    from smoketree.backends.comfyui import ComfyUIBackend
+
+    class _CapClient:
+        def post(self, url, files=None, data=None):
+            name = files["image"][0]
+
+            class _R:
+                status_code = 200
+
+                def json(self):
+                    return {"name": name}
+
+            return _R()
+
+    a = tmp_path / "a.png"; a.write_bytes(b"AAA")
+    b = tmp_path / "b.png"; b.write_bytes(b"BBB")
+    be, c = ComfyUIBackend(), _CapClient()
+    n1, n2, n3 = be._upload_image(c, a), be._upload_image(c, b), be._upload_image(c, a)
+    assert n1 != n2          # distinct content -> distinct upload name
+    assert n1 == n3          # identical content -> same name (dedupe)
+    assert n1.startswith("smoketree_")
+
+
 def test_comfyui_strips_annotation_keys():
     from smoketree.backends.comfyui import _node_dict
 

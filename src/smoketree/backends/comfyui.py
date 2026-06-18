@@ -7,6 +7,7 @@ are polled from history and downloaded to the output target.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -93,10 +94,16 @@ class ComfyUIBackend(Backend):
             node["inputs"][inject.field] = value
 
     def _upload_image(self, client: httpx.Client, path: Path) -> str:
-        files = {"image": (path.name, path.read_bytes())}
+        data = path.read_bytes()
+        # Content-addressed upload name: ComfyUI's LoadImage caches by filename across
+        # prompts, so reusing a generic name (every node's output is "image.png") would
+        # serve a stale/wrong image to later cells. A content hash keeps distinct images
+        # distinct and dedupes identical ones.
+        name = f"smoketree_{hashlib.sha256(data).hexdigest()[:16]}{path.suffix.lower()}"
+        files = {"image": (name, data)}
         resp = client.post("/upload/image", files=files, data={"overwrite": "true"})
         if resp.status_code >= 400:
-            raise ExecutionError(_http_detail(f"upload image '{path.name}'", resp))
+            raise ExecutionError(_http_detail(f"upload image '{name}'", resp))
         return resp.json()["name"]
 
     def _submit(self, client: httpx.Client, workflow: dict, client_id: str) -> str:
