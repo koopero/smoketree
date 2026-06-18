@@ -111,6 +111,14 @@ def scratch_instance_dir(
     return _instance_dir(project.scratch_dir / graph_id, node_id, inst_hash, take)
 
 
+def materialize_dir(
+    project: Project, graph_id: str, node_id: str, inst_hash: str | None
+) -> Path:
+    """User-owned, take-independent home for a `materialize` node's artifact."""
+    node_dir = project.scenes_dir / graph_id / node_id
+    return node_dir / inst_hash if inst_hash is not None else node_dir
+
+
 # --------------------------------------------------------------------------- #
 # State file
 # --------------------------------------------------------------------------- #

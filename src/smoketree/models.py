@@ -91,6 +91,10 @@ class NodeDef(BaseModel):
     expand: ExpandStrategy | None = None
     # force-export this node's outputs to outputs/ even if it isn't a terminal node
     output: bool = False
+    # generate this node's output once into a user-owned dir (scenes/), then treat it as
+    # an editable source of truth: never overwrite it, hash its current content for
+    # downstream, regenerate only if missing or --force. Requires exactly one output.
+    materialize: bool = False
 
 
 class GraphDef(BaseModel):

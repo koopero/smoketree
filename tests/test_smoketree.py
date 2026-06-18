@@ -801,6 +801,107 @@ def test_instance_hash_stable_and_distinct():
 
 
 # --------------------------------------------------------------------------- #
+# materialize (generate-once, then owned source of truth)
+# --------------------------------------------------------------------------- #
+
+
+# A "generator" shell transformer that stamps the seed into a file (so we can tell a
+# regeneration from a kept file), and a consumer that copies its input.
+_GEN_TRANSFORMER = (
+    "name: gen\ntype: shell\n"
+    "command: 'printf \"gen seed={seed}\\n\" > {outputs.doc}'\n"
+    "inputs: {}\n"
+    "outputs:\n  doc: {type: file, media: text, format: txt}\n"
+)
+_COPY_TRANSFORMER = (
+    "name: copydoc\ntype: shell\n"
+    "command: cp {inputs.src} {outputs.text}\n"
+    "inputs:\n  src: {type: file, media: text}\n"
+    "outputs:\n  text: {type: file, media: text, format: txt}\n"
+)
+
+
+@pytest.fixture
+def materialize_project(project: Project) -> Project:
+    (project.transformers_dir / "gen.yaml").write_text(_GEN_TRANSFORMER)
+    (project.transformers_dir / "copydoc.yaml").write_text(_COPY_TRANSFORMER)
+    (project.graphs_dir / "m.yaml").write_text(
+        "name: m\n"
+        "nodes:\n"
+        "  asset: {type: transform, transformer: gen, materialize: true, inputs: {}}\n"
+        "  derived: {type: transform, transformer: copydoc, inputs: {src: asset}}\n"
+    )
+    return project
+
+
+def _asset_file(project: Project):
+    import glob as _g
+    hits = _g.glob(str(project.scenes_dir / "m" / "asset" / "doc.*"))
+    return Path(hits[0]) if hits else None
+
+
+def test_materialize_validation_requires_single_output(project: Project):
+    (project.transformers_dir / "multi.yaml").write_text(
+        "name: multi\ntype: shell\ncommand: 'true'\n"
+        "inputs: {}\n"
+        "outputs:\n  a: {type: file, media: text}\n  b: {type: file, media: text}\n"
+    )
+    (project.graphs_dir / "bad.yaml").write_text(
+        "name: bad\nnodes:\n"
+        "  x: {type: transform, transformer: multi, materialize: true, inputs: {}}\n"
+    )
+    with pytest.raises(ValidationError, match="materialize requires exactly one"):
+        load_graph(project, "bad")
+
+
+def test_materialize_generates_once_into_scenes(materialize_project: Project):
+    from smoketree.executor import run
+
+    graph = load_graph(materialize_project, "m")
+    run(materialize_project, graph, take=0)
+    asset = _asset_file(materialize_project)
+    assert asset is not None and asset.exists()      # generated under scenes/
+    assert "scenes" in str(asset)
+    assert not str(asset).startswith(str(materialize_project.smoketree_dir))
+
+
+def test_materialize_kept_not_regenerated(materialize_project: Project):
+    from smoketree.executor import run
+
+    graph = load_graph(materialize_project, "m")
+    run(materialize_project, graph, take=0)
+    asset = _asset_file(materialize_project)
+    asset.write_text("HAND EDITED\n")           # artist owns it
+    run(materialize_project, graph, take=0)      # re-run
+    assert asset.read_text() == "HAND EDITED\n"  # not overwritten
+
+
+def test_materialize_edit_propagates_downstream(materialize_project: Project):
+    from smoketree.executor import run
+
+    graph = load_graph(materialize_project, "m")
+    run(materialize_project, graph, take=0)
+    asset = _asset_file(materialize_project)
+    asset.write_text("EDITED CONTENT\n")
+    run(materialize_project, graph, take=0)      # derived should rebuild from the edit
+    derived = (
+        cachelib.cache_node_dir(materialize_project, "m", "derived", 0) / "text.txt"
+    )
+    assert derived.read_text() == "EDITED CONTENT\n"
+
+
+def test_materialize_force_regenerates(materialize_project: Project):
+    from smoketree.executor import run
+
+    graph = load_graph(materialize_project, "m")
+    run(materialize_project, graph, take=0)
+    asset = _asset_file(materialize_project)
+    asset.write_text("HAND EDITED\n")
+    run(materialize_project, graph, take=0, force=True)
+    assert asset.read_text() != "HAND EDITED\n"   # regenerated
+
+
+# --------------------------------------------------------------------------- #
 # Grouped collections + multi-file inputs
 # --------------------------------------------------------------------------- #
 

@@ -244,6 +244,12 @@ def _validate_node_shapes(
                 name: InputRef.parse(ref) for name, ref in node.inputs.items()
             }
             _validate_node_inputs(node_id, node, transformer)
+            if node.materialize and len(transformer.outputs) != 1:
+                raise ValidationError(
+                    f"Node '{node_id}' uses materialize but its transformer "
+                    f"'{transformer.name}' declares {len(transformer.outputs)} outputs "
+                    f"(materialize requires exactly one)."
+                )
 
 
 def _validate_node_inputs(

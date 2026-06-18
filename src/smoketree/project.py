@@ -73,6 +73,11 @@ class Project:
         return self.root / "outputs"
 
     @property
+    def scenes_dir(self) -> Path:
+        # user-owned, version-controllable home for `materialize` artifacts
+        return self.root / "scenes"
+
+    @property
     def smoketree_dir(self) -> Path:
         return self.root / ".smoketree"
 

@@ -141,17 +141,41 @@ class Resolver:
         transformer = self.graph.transformers[node_id]
         spec = transformer.outputs[output_name]
         collection = self.graph.is_collection(node_id)
+        materialize = node.materialize
         artifacts: list[Artifact] = []
         for inst in self.transform_instances(node_id):
             inst_hash = inst.hash if collection else None
-            art = self._read_instance_output(node_id, output_name, inst_hash, spec.media)
+            if materialize:
+                art = self._read_materialized(node_id, output_name, inst_hash, spec.media)
+            else:
+                art = self._read_instance_output(
+                    node_id, output_name, inst_hash, spec.media
+                )
             if art is None:
                 raise ExecutionError(
-                    f"Dependency '{node_id}.{output_name}' has no cached output for "
-                    f"instance {inst.label(node_id)}. Run the graph at take 0 first."
+                    f"Dependency '{node_id}.{output_name}' has no "
+                    f"{'materialized artifact' if materialize else 'cached output'} for "
+                    f"instance {inst.label(node_id)}. Run the graph first."
                 )
             artifacts.append(art)
         return artifacts
+
+    def _read_materialized(
+        self, node_id: str, output_name: str, inst_hash: str | None, media
+    ) -> Artifact | None:
+        node_dir = cachelib.materialize_dir(
+            self.project, self.graph.id, node_id, inst_hash
+        )
+        matches = sorted(node_dir.glob(f"{output_name}.*"))
+        if not matches:
+            return None
+        path = matches[0]
+        return Artifact(
+            path=path,
+            media=media,
+            format=path.suffix.lstrip(".").lower() or None,
+            content_hash=cachelib.hash_file(path),
+        )
 
     def _filter_collection(
         self, node_id: str, filter_tag: str | None
@@ -469,6 +493,11 @@ def _instance_cached(
 ) -> bool:
     collection = graph.is_collection(node_id)
     inst_hash = inst.hash if collection else None
+    if graph.nodes[node_id].materialize:
+        # an owned materialized artifact counts as built (regenerated only if missing)
+        out = next(iter(graph.transformers[node_id].outputs))
+        mdir = cachelib.materialize_dir(project, graph.id, node_id, inst_hash)
+        return bool(list(mdir.glob(f"{out}.*")))
     key = compute_node_cache_key(project, graph, node_id, inst.inputs, take)
     recorded = state.get(node_id, inst.hash)
     return (
@@ -511,6 +540,7 @@ def run(
 
         instances = resolver.transform_instances(node_id)
         collection = graph.is_collection(node_id)
+        materialize = node.materialize
         fresh_links: set[Path] = set()
         for inst in instances:
             col = (
@@ -521,25 +551,33 @@ def run(
             key = compute_node_cache_key(project, graph, node_id, inst.inputs, take)
             inst_hash = inst.hash if collection else None
 
-            cached = (
-                not force
-                and (rec := state.get(node_id, inst.hash)) is not None
-                and rec.input_hash == key
-                and _instance_outputs_present(project, graph, node_id, inst_hash, take)
-            )
-            if cached:
-                report(f"[SKIP]  {col}(cached)")
+            if materialize:
+                _run_materialize(
+                    project, graph, node_id, inst, inst_hash, take, key, force,
+                    state, col, report,
+                )
             else:
-                report(f"[RUN ]  {col}...")
-                started = time.monotonic()
-                produced = _execute_instance(project, graph, node_id, inst, take)
-                elapsed = time.monotonic() - started
-                _validate_outputs(graph, node_id, produced, report)
-                if collection:
-                    _write_instance_sidecar(project, graph, node_id, inst, take)
-                state.record(node_id, inst.hash, key, take)
-                state.save()
-                report(f"[DONE]  {col}({elapsed:.1f}s)")
+                cached = (
+                    not force
+                    and (rec := state.get(node_id, inst.hash)) is not None
+                    and rec.input_hash == key
+                    and _instance_outputs_present(
+                        project, graph, node_id, inst_hash, take
+                    )
+                )
+                if cached:
+                    report(f"[SKIP]  {col}(cached)")
+                else:
+                    report(f"[RUN ]  {col}...")
+                    started = time.monotonic()
+                    produced = _execute_instance(project, graph, node_id, inst, take)
+                    elapsed = time.monotonic() - started
+                    _validate_outputs(graph, node_id, produced, report)
+                    if collection:
+                        _write_instance_sidecar(project, graph, node_id, inst, take)
+                    state.record(node_id, inst.hash, key, take)
+                    state.save()
+                    report(f"[DONE]  {col}({elapsed:.1f}s)")
 
             # Export this instance immediately so outputs/ fills in as the run proceeds.
             if node_id in exported:
@@ -557,6 +595,7 @@ def _execute_instance(
     node_id: str,
     inst: Instance,
     take: int,
+    output_dir: Path | None = None,
 ) -> dict[str, Artifact]:
     transformer = graph.transformers[node_id]
     collection = graph.is_collection(node_id)
@@ -565,9 +604,10 @@ def _execute_instance(
     scratch_dir = cachelib.scratch_instance_dir(
         project, graph.id, node_id, inst_hash, take
     )
-    output_dir = cachelib.cache_instance_dir(
-        project, graph.id, node_id, inst_hash, take
-    )
+    if output_dir is None:
+        output_dir = cachelib.cache_instance_dir(
+            project, graph.id, node_id, inst_hash, take
+        )
     # Scratch and the take's cache dir are cleared and recreated so no stale outputs
     # linger across reruns.
     _reset_dir(scratch_dir)
@@ -662,6 +702,48 @@ def _reset_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _run_materialize(
+    project: Project,
+    graph: ResolvedGraph,
+    node_id: str,
+    inst: Instance,
+    inst_hash: str | None,
+    take: int,
+    key: str,
+    force: bool,
+    state: State,
+    col: str,
+    report: Reporter,
+) -> None:
+    """Generate a materialized artifact once, then treat it as an owned source.
+
+    Existing file -> [KEEP] (never overwritten; a staleness note if inputs changed).
+    Missing (or --force) -> [GEN] into scenes/.
+    """
+    output_name = next(iter(graph.transformers[node_id].outputs))
+    mdir = cachelib.materialize_dir(project, graph.id, node_id, inst_hash)
+    existing = sorted(mdir.glob(f"{output_name}.*"))
+
+    if existing and not force:
+        rec = state.get(node_id, inst.hash)
+        stale = (
+            "  (inputs changed; --force to rebuild)"
+            if rec is not None and rec.input_hash != key
+            else ""
+        )
+        report(f"[KEEP]  {col}(owned){stale}")
+        return
+
+    report(f"[GEN ]  {col}...")
+    started = time.monotonic()
+    produced = _execute_instance(project, graph, node_id, inst, take, output_dir=mdir)
+    elapsed = time.monotonic() - started
+    _validate_outputs(graph, node_id, produced, report)
+    state.record(node_id, inst.hash, key, take)
+    state.save()
+    report(f"[GEN ]  {col}({elapsed:.1f}s)")
 
 
 def _exported_nodes(graph: ResolvedGraph, order: list[str]) -> set[str]:
