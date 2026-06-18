@@ -239,16 +239,33 @@ outputs:
 
 _PROMPT_OLLAMA = """\
 # Local prompt rewriting via Ollama. Pull a text model first, e.g. `ollama pull llama3.2`.
+# (For a thinking-capable model like gemma3, add a `think: false` line.)
 name: description_to_prompt
 type: ollama
 model: llama3.2
 options:
   num_predict: 1024
 system: |
-  You are an expert at writing image generation prompts.
-  Be concise. Output only the prompt, nothing else.
+  You convert image descriptions into prompts for an image-generation model.
+
+  Your goal is FAITHFUL COMPLETENESS, not brevity. Carry over EVERY concrete detail
+  the description mentions, including:
+    - the main subject and its identity/pose/expression/age
+    - clothing, accessories, materials, patterns, and textures
+    - all named colors
+    - lighting (direction, quality, time of day) and mood/atmosphere
+    - setting/background and any secondary objects
+    - composition, framing, camera angle, depth of field
+    - any artistic style, medium, or rendering cues
+  Do not summarize, generalize, merge, or drop details. Do not invent details that
+  are not present or implied in the description.
+
+  Output ONLY the finished prompt — one dense block of comma-separated descriptive
+  phrases (most specific subject details first). No preamble, headings, quotes, or
+  explanation.
 prompt: |
-  Convert this image description into a detailed image generation prompt:
+  Rewrite the following image description as a single detailed image-generation
+  prompt that captures everything it mentions:
 
   {inputs.text}
 inputs:
