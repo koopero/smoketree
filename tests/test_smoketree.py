@@ -31,7 +31,9 @@ from smoketree.scaffold import init_project
 
 @pytest.fixture
 def project(tmp_path: Path) -> Project:
-    init_project(tmp_path, "test-proj")
+    # The "demo" template provides the `shout` transformer + textproc script that
+    # most graph/collection tests build on, plus the demo graph itself.
+    init_project(tmp_path, "test-proj", template="demo")
     return Project(tmp_path)
 
 
@@ -44,6 +46,56 @@ def test_scaffold_writes_instructions(project: Project):
     instructions = project.root / "INSTRUCTIONS.md"
     assert instructions.exists()
     assert "Smoketree project" in instructions.read_text()
+
+
+# --------------------------------------------------------------------------- #
+# init templates
+# --------------------------------------------------------------------------- #
+
+
+def test_init_default_is_minimal(tmp_path: Path):
+    init_project(tmp_path, "p")  # default template
+    assert (tmp_path / "smoketree.yaml").exists()
+    assert (tmp_path / "INSTRUCTIONS.md").exists()
+    # standard dirs exist but no example graphs
+    assert (tmp_path / "graphs").is_dir()
+    assert (tmp_path / "transformers").is_dir()
+    assert not list((tmp_path / "graphs").glob("*.yaml"))
+
+
+def test_init_substitutes_project_name(tmp_path: Path):
+    init_project(tmp_path, "my-cool-proj")
+    config = (tmp_path / "smoketree.yaml").read_text()
+    assert "name: my-cool-proj" in config
+    assert "__PROJECT_NAME__" not in config
+
+
+def test_init_template_demo(tmp_path: Path):
+    init_project(tmp_path, "p", template="demo")
+    assert (tmp_path / "graphs" / "demo.yaml").exists()
+    assert (tmp_path / "transformers" / "shout.yaml").exists()
+    assert (tmp_path / "scripts" / "textproc.py").exists()
+
+
+def test_init_template_portrait(tmp_path: Path):
+    init_project(tmp_path, "p", template="portrait")
+    assert (tmp_path / "graphs" / "portrait.yaml").exists()
+    txt2img = (tmp_path / "transformers" / "txt2img.yaml").read_text()
+    assert "seed_inject" in txt2img  # demonstrates the seed injection feature
+
+
+def test_init_unknown_template_errors(tmp_path: Path):
+    with pytest.raises(SmoketreeError, match="Unknown template"):
+        init_project(tmp_path, "p", template="nope")
+
+
+def test_list_templates():
+    from smoketree.scaffold import list_templates
+
+    templates = list_templates()
+    assert "minimal" in templates
+    assert "portrait" in templates
+    assert all(isinstance(v, str) for v in templates.values())
 
 
 def test_env_substitution(monkeypatch):
@@ -68,8 +120,9 @@ def test_demo_topological_order(project: Project):
     assert graph.execution_order == ["text", "shout", "reverse", "stats"]
 
 
-def test_portrait_topological_order(project: Project):
-    graph = load_graph(project, "portrait")
+def test_portrait_topological_order(tmp_path: Path):
+    init_project(tmp_path, "p", template="portrait")
+    graph = load_graph(Project(tmp_path), "portrait")
     assert graph.execution_order == [
         "source",
         "description",
@@ -91,11 +144,18 @@ def test_cycle_detection(project: Project):
 
 
 def test_media_type_mismatch(project: Project):
+    (project.transformers_dir / "needs_image.yaml").write_text(
+        "name: needs_image\n"
+        "type: shell\n"
+        "command: cp {inputs.image} {outputs.x}\n"
+        "inputs:\n  image: {type: file, media: image}\n"
+        "outputs:\n  x: {type: file, media: data}\n"
+    )
     (project.graphs_dir / "mm.yaml").write_text(
         "name: mm\n"
         "nodes:\n"
-        "  t: {type: source, path: sources/hello.txt}\n"
-        "  b: {type: transform, transformer: describe, inputs: {image: t}}\n"
+        "  t: {type: source, path: sources/hello.txt}\n"  # text feeding an image input
+        "  b: {type: transform, transformer: needs_image, inputs: {image: t}}\n"
     )
     with pytest.raises(ValidationError, match="Media type mismatch"):
         load_graph(project, "mm")

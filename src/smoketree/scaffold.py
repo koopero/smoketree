@@ -1,8 +1,8 @@
 """Project scaffolding for ``smoketree init``.
 
-Creates the directory layout, a project config, and a small set of example graphs and
-transformers — including a fully offline-runnable ``demo`` graph (shell only) and the
-canonical ``portrait`` AI pipeline from the design.
+`init` creates a project from a chosen **starter template** (see ``TEMPLATES``). Every
+project also gets the shared ``INSTRUCTIONS.md`` guide, a ``.gitignore``, and the standard
+directory skeleton. The default template, ``minimal``, is just the bare skeleton.
 """
 
 from __future__ import annotations
@@ -12,23 +12,17 @@ from pathlib import Path
 
 from .errors import SmoketreeError
 
+_NAME_TOKEN = "__PROJECT_NAME__"
+_STANDARD_DIRS = ("graphs", "transformers", "sources", "outputs")
 
-def _template(name: str) -> str:
-    """Read a packaged template file from ``smoketree/templates/``."""
-    return resources.files("smoketree").joinpath("templates", name).read_text()
 
-_SMOKETREE_YAML = """\
-name: {name}
+def _instructions() -> str:
+    return resources.files("smoketree").joinpath("templates", "INSTRUCTIONS.md").read_text()
 
-defaults:
-  comfyui_url: http://localhost:8188
-  ollama_url: http://localhost:11434
-  take: 0
 
-env:
-  ANTHROPIC_API_KEY: ${{ANTHROPIC_API_KEY}}
-  OPENAI_API_KEY: ${{OPENAI_API_KEY}}
-"""
+# --------------------------------------------------------------------------- #
+# Shared files (written into every project)
+# --------------------------------------------------------------------------- #
 
 _GITIGNORE = """\
 .smoketree/
@@ -37,105 +31,32 @@ outputs/
 __pycache__/
 """
 
-_ENV = """\
-# Filled in by you. Shell environment takes precedence over this file.
-ANTHROPIC_API_KEY=
-OPENAI_API_KEY=
+# --------------------------------------------------------------------------- #
+# Project config variants
+# --------------------------------------------------------------------------- #
+
+_CONFIG_MINIMAL = f"""\
+name: {_NAME_TOKEN}
+
+defaults:
+  take: 0
 """
 
-_HELLO = "the smoketree diffuses like pixels\n"
+_CONFIG_AI = f"""\
+name: {_NAME_TOKEN}
 
-# --- demo graph (offline, shell only) -------------------------------------- #
-
-_DEMO_GRAPH = """\
-name: demo
-
-nodes:
-  text:
-    type: source
-    path: sources/hello.txt
-
-  shout:
-    type: transform
-    transformer: shout
-    inputs:
-      input: text
-
-  reverse:
-    type: transform
-    transformer: reverse
-    inputs:
-      input: shout
-
-  stats:
-    type: transform
-    transformer: wordstats
-    inputs:
-      input: reverse
+defaults:
+  comfyui_url: http://localhost:8188
+  ollama_url: http://localhost:11434
+  take: 0
 """
 
-_FANOUT_GRAPH = """\
-name: fanout
-
-# Demonstrates collection nodes + fan-out. `items` resolves to every matching file;
-# `shout` runs once per item (expand: each). See INSTRUCTIONS.md for product/zip.
-nodes:
-  items:
-    type: collection
-    glob: sources/items/*.txt
-
-  shout:
-    type: transform
-    transformer: shout
-    inputs:
-      input: items
-    expand: each
-"""
-
-_TAGGED_GRAPH = """\
-name: tagged
-
-# Tagged collection + filter_tag. `refs` items carry role tags; `loud` filters to the
-# 'shout' tag (2 items -> fan-out), `quiet` filters to 'whisper' (1 item -> scalar).
-nodes:
-  refs:
-    type: collection
-    sources:
-      - {path: sources/items/one.txt, tags: [shout, primary]}
-      - {path: sources/items/two.txt, tags: [shout]}
-      - {path: sources/items/three.txt, tags: [whisper]}
-
-  loud:
-    type: transform
-    transformer: shout
-    inputs:
-      input: refs[shout]
-    expand: each
-
-  quiet:
-    type: transform
-    transformer: shout
-    inputs:
-      input: refs[whisper]
-"""
-
-_SHELL_TRANSFORMER = """\
-name: {name}
-type: shell
-command: python scripts/textproc.py --op {op} --in {{inputs.input}} --out {{outputs.text}}
-inputs:
-  input:
-    type: file
-    media: text
-outputs:
-  text:
-    type: file
-    media: text
-    format: txt
-"""
+# --------------------------------------------------------------------------- #
+# Shared building blocks (shell text-processing example)
+# --------------------------------------------------------------------------- #
 
 _TEXTPROC = '''\
-"""Tiny text transformer used by the demo graph."""
+"""Tiny text transformer used by the shell example graphs."""
 
 import argparse
 
@@ -166,7 +87,102 @@ if __name__ == "__main__":
     main()
 '''
 
-# --- portrait graph (canonical AI pipeline) -------------------------------- #
+
+def _shell_transformer(name: str, op: str) -> str:
+    return (
+        f"name: {name}\n"
+        "type: shell\n"
+        f"command: python scripts/textproc.py --op {op} "
+        "--in {inputs.input} --out {outputs.text}\n"
+        "inputs:\n"
+        "  input:\n"
+        "    type: file\n"
+        "    media: text\n"
+        "outputs:\n"
+        "  text:\n"
+        "    type: file\n"
+        "    media: text\n"
+        "    format: txt\n"
+    )
+
+
+_ITEMS = {
+    "sources/items/one.txt": "first item\n",
+    "sources/items/two.txt": "second item\n",
+    "sources/items/three.txt": "third item\n",
+}
+
+# --------------------------------------------------------------------------- #
+# Graph definitions
+# --------------------------------------------------------------------------- #
+
+_DEMO_GRAPH = """\
+name: demo
+
+nodes:
+  text:
+    type: source
+    path: sources/hello.txt
+  shout:
+    type: transform
+    transformer: shout
+    inputs:
+      input: text
+  reverse:
+    type: transform
+    transformer: reverse
+    inputs:
+      input: shout
+  stats:
+    type: transform
+    transformer: wordstats
+    inputs:
+      input: reverse
+"""
+
+_FANOUT_GRAPH = """\
+name: fanout
+
+# Collection fan-out: `items` resolves to every matching file; `shout` runs once per
+# item (expand: each). See INSTRUCTIONS.md for product/zip.
+nodes:
+  items:
+    type: collection
+    glob: sources/items/*.txt
+  shout:
+    type: transform
+    transformer: shout
+    inputs:
+      input: items
+    expand: each
+"""
+
+_TAGGED_GRAPH = """\
+name: tagged
+
+# Tagged collection + filter_tag. `refs` items carry role tags; `loud` filters to the
+# 'shout' tag (2 items -> fan-out), `quiet` filters to 'whisper' (1 item -> scalar).
+nodes:
+  refs:
+    type: collection
+    sources:
+      - {path: sources/items/one.txt, tags: [shout, primary]}
+      - {path: sources/items/two.txt, tags: [shout]}
+      - {path: sources/items/three.txt, tags: [whisper]}
+  loud:
+    type: transform
+    transformer: shout
+    inputs:
+      input: refs[shout]
+    expand: each
+  quiet:
+    type: transform
+    transformer: shout
+    inputs:
+      input: refs[whisper]
+"""
+
+# --- portrait (local-first AI pipeline) ------------------------------------ #
 
 _PORTRAIT_GRAPH = """\
 name: portrait
@@ -175,25 +191,21 @@ nodes:
   source:
     type: source
     path: sources/subject.jpg
-
   description:
     type: transform
     transformer: describe
     inputs:
       image: source
-
   prompt:
     type: transform
     transformer: description_to_prompt
     inputs:
       text: description
-
   generated:
     type: transform
     transformer: txt2img
     inputs:
       prompt: prompt
-
   upscaled:
     type: transform
     transformer: upscale
@@ -201,11 +213,19 @@ nodes:
       image: generated
 """
 
-_DESCRIBE = """\
-# Shell stub. Swap for a `type: claude` or `type: ollama` transformer for real output.
+_DESCRIBE_OLLAMA = """\
+# Local image description via Ollama. Pull a vision model first, e.g. `ollama pull llava`.
+# For thinking-capable vision models (e.g. gemma3), add a `think: false` line.
 name: describe
-type: shell
-command: python scripts/describe.py --image {inputs.image} --out {outputs.text}
+type: ollama
+model: llava
+options:
+  num_predict: 300
+system: You are a precise visual analyst. Describe images in rich, accurate detail.
+prompt: |
+  Describe this image in detail: subject, colors, lighting, composition, and mood.
+
+  {inputs.image}
 inputs:
   image:
     type: file
@@ -215,66 +235,11 @@ outputs:
     type: file
     media: text
     format: txt
-env:
-  OPENAI_API_KEY: ${OPENAI_API_KEY}
 """
 
-_DESCRIBE_PY = '''\
-"""Shell-stub image describer. Replace with a real vision model call."""
-
-import argparse
-import os
-from pathlib import Path
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image", required=True)
-    parser.add_argument("--out", required=True)
-    args = parser.parse_args()
-
-    seed = os.environ.get("SMOKETREE_SEED", "0")
-    name = Path(args.image).name
-    description = (
-        f"A placeholder description of {name} "
-        f"(stub describer, seed {seed}). "
-        "Replace transformers/describe.yaml with the claude version for real output."
-    )
-    Path(args.out).write_text(description + "\\n")
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-_DESCRIPTION_TO_PROMPT = """\
+_PROMPT_OLLAMA = """\
+# Local prompt rewriting via Ollama. Pull a text model first, e.g. `ollama pull llama3.2`.
 name: description_to_prompt
-type: claude
-model: claude-sonnet-4-6
-max_tokens: 1024
-system: |
-  You are an expert at writing image generation prompts.
-  Be concise. Output only the prompt, nothing else.
-prompt: |
-  Convert this image description into a detailed image generation prompt:
-
-  {inputs.text}
-inputs:
-  text:
-    type: file
-    media: text
-outputs:
-  prompt:
-    type: file
-    media: text
-    format: txt
-"""
-
-_DESCRIPTION_TO_PROMPT_LOCAL = """\
-# Local-first alternative to description_to_prompt.yaml. Point a graph at this
-# transformer to run the prompt-rewriting step on a local Ollama model instead of
-# the Anthropic API. Requires `ollama serve` and `ollama pull llama3.2`.
-name: description_to_prompt_local
 type: ollama
 model: llama3.2
 options:
@@ -301,12 +266,16 @@ _TXT2IMG_YAML = """\
 name: txt2img
 type: comfyui
 workflow: txt2img.json
+# Inject the per-take seed so different --take values produce different images.
+seed_inject:
+  node_id: "3"          # KSampler node in your workflow
+  field: seed
 inputs:
   prompt:
     type: file
     media: text
     inject:
-      node_id: "6"          # positive prompt node in your workflow
+      node_id: "6"        # positive prompt (CLIPTextEncode) node
       field: text
 outputs:
   image:
@@ -314,21 +283,16 @@ outputs:
     media: image
     format: png
     collect:
-      node_id: "9"          # SaveImage node in your workflow
+      node_id: "9"        # SaveImage node
       field: filename_prefix
 """
 
 _TXT2IMG_JSON = """\
 {
-  "_comment": "Replace with your own ComfyUI API-format workflow export.",
-  "6": {
-    "class_type": "CLIPTextEncode",
-    "inputs": {"text": "placeholder prompt"}
-  },
-  "9": {
-    "class_type": "SaveImage",
-    "inputs": {"filename_prefix": "smoketree_txt2img"}
-  }
+  "_comment": "Replace with your own ComfyUI API-format workflow export (Save (API Format)).",
+  "3": {"class_type": "KSampler", "inputs": {"seed": 0, "steps": 20}},
+  "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "placeholder prompt"}},
+  "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "smoketree_txt2img"}}
 }
 """
 
@@ -355,21 +319,98 @@ outputs:
 
 _UPSCALE_JSON = """\
 {
-  "_comment": "Replace with your own ComfyUI API-format workflow export.",
-  "12": {
-    "class_type": "LoadImage",
-    "inputs": {"image": "placeholder.png"}
-  },
-  "27": {
-    "class_type": "SaveImage",
-    "inputs": {"filename_prefix": "smoketree_upscale"}
-  }
+  "_comment": "Replace with your own ComfyUI API-format workflow export (Save (API Format)).",
+  "12": {"class_type": "LoadImage", "inputs": {"image": "placeholder.png"}},
+  "27": {"class_type": "SaveImage", "inputs": {"filename_prefix": "smoketree_upscale"}}
 }
 """
 
+_PORTRAIT_SOURCES_NOTE = (
+    "Put your input image here as `subject.jpg` "
+    "(referenced by graphs/portrait.yaml).\n"
+)
 
-def init_project(root: Path, name: str, force: bool = False) -> list[Path]:
-    """Scaffold a project at ``root``. Returns the list of created files."""
+
+# --------------------------------------------------------------------------- #
+# Template catalog
+# --------------------------------------------------------------------------- #
+
+
+class Template:
+    def __init__(self, description: str, files: dict[str, str]):
+        self.description = description
+        self.files = files
+
+
+TEMPLATES: dict[str, Template] = {
+    "minimal": Template(
+        "Bare skeleton — just smoketree.yaml and empty dirs.",
+        {"smoketree.yaml": _CONFIG_MINIMAL},
+    ),
+    "demo": Template(
+        "Offline shell pipeline: source -> shout -> reverse -> stats.",
+        {
+            "smoketree.yaml": _CONFIG_MINIMAL,
+            "sources/hello.txt": "the smoketree diffuses like pixels\n",
+            "graphs/demo.yaml": _DEMO_GRAPH,
+            "transformers/shout.yaml": _shell_transformer("shout", "upper"),
+            "transformers/reverse.yaml": _shell_transformer("reverse", "reverse"),
+            "transformers/wordstats.yaml": _shell_transformer("wordstats", "stats"),
+            "scripts/textproc.py": _TEXTPROC,
+        },
+    ),
+    "fanout": Template(
+        "Collection fan-out: one execution per globbed file (expand: each).",
+        {
+            "smoketree.yaml": _CONFIG_MINIMAL,
+            **_ITEMS,
+            "graphs/fanout.yaml": _FANOUT_GRAPH,
+            "transformers/shout.yaml": _shell_transformer("shout", "upper"),
+            "scripts/textproc.py": _TEXTPROC,
+        },
+    ),
+    "tagged": Template(
+        "Tagged collection + filter_tag (multi-match fans out, single is scalar).",
+        {
+            "smoketree.yaml": _CONFIG_MINIMAL,
+            **_ITEMS,
+            "graphs/tagged.yaml": _TAGGED_GRAPH,
+            "transformers/shout.yaml": _shell_transformer("shout", "upper"),
+            "scripts/textproc.py": _TEXTPROC,
+        },
+    ),
+    "portrait": Template(
+        "Local-first AI: ollama describe -> ollama prompt -> comfyui txt2img/upscale.",
+        {
+            "smoketree.yaml": _CONFIG_AI,
+            "sources/README.txt": _PORTRAIT_SOURCES_NOTE,
+            "graphs/portrait.yaml": _PORTRAIT_GRAPH,
+            "transformers/describe.yaml": _DESCRIBE_OLLAMA,
+            "transformers/description_to_prompt.yaml": _PROMPT_OLLAMA,
+            "transformers/txt2img.yaml": _TXT2IMG_YAML,
+            "transformers/txt2img.json": _TXT2IMG_JSON,
+            "transformers/upscale.yaml": _UPSCALE_YAML,
+            "transformers/upscale.json": _UPSCALE_JSON,
+        },
+    ),
+}
+
+DEFAULT_TEMPLATE = "minimal"
+
+
+def list_templates() -> dict[str, str]:
+    """Template name -> one-line description, for ``smoketree init --list``."""
+    return {name: tpl.description for name, tpl in TEMPLATES.items()}
+
+
+def init_project(
+    root: Path, name: str, template: str = DEFAULT_TEMPLATE, force: bool = False
+) -> list[Path]:
+    """Scaffold a project at ``root`` from ``template``. Returns created files."""
+    if template not in TEMPLATES:
+        raise SmoketreeError(
+            f"Unknown template '{template}'. Available: {', '.join(TEMPLATES)}."
+        )
     config_path = root / "smoketree.yaml"
     if config_path.exists() and not force:
         raise SmoketreeError(
@@ -377,45 +418,19 @@ def init_project(root: Path, name: str, force: bool = False) -> list[Path]:
         )
 
     files: dict[str, str] = {
-        "smoketree.yaml": _SMOKETREE_YAML.format(name=name),
-        "INSTRUCTIONS.md": _template("INSTRUCTIONS.md"),
+        **TEMPLATES[template].files,
+        "INSTRUCTIONS.md": _instructions(),
         ".gitignore": _GITIGNORE,
-        ".env": _ENV,
-        "sources/hello.txt": _HELLO,
-        "sources/items/one.txt": "first item\n",
-        "sources/items/two.txt": "second item\n",
-        "sources/items/three.txt": "third item\n",
-        "graphs/demo.yaml": _DEMO_GRAPH,
-        "graphs/fanout.yaml": _FANOUT_GRAPH,
-        "graphs/tagged.yaml": _TAGGED_GRAPH,
-        "graphs/portrait.yaml": _PORTRAIT_GRAPH,
-        "transformers/shout.yaml": _SHELL_TRANSFORMER.format(name="shout", op="upper"),
-        "transformers/reverse.yaml": _SHELL_TRANSFORMER.format(
-            name="reverse", op="reverse"
-        ),
-        "transformers/wordstats.yaml": _SHELL_TRANSFORMER.format(
-            name="wordstats", op="stats"
-        ),
-        "transformers/describe.yaml": _DESCRIBE,
-        "transformers/description_to_prompt.yaml": _DESCRIPTION_TO_PROMPT,
-        "transformers/description_to_prompt_local.yaml": _DESCRIPTION_TO_PROMPT_LOCAL,
-        "transformers/txt2img.yaml": _TXT2IMG_YAML,
-        "transformers/txt2img.json": _TXT2IMG_JSON,
-        "transformers/upscale.yaml": _UPSCALE_YAML,
-        "transformers/upscale.json": _UPSCALE_JSON,
-        "scripts/textproc.py": _TEXTPROC,
-        "scripts/describe.py": _DESCRIBE_PY,
     }
 
     created: list[Path] = []
     for rel, content in files.items():
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        path.write_text(content.replace(_NAME_TOKEN, name))
         created.append(path)
 
-    # Empty dirs that hold generated/user content.
-    for rel in ("outputs",):
+    for rel in _STANDARD_DIRS:
         (root / rel).mkdir(parents=True, exist_ok=True)
 
     return created

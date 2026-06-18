@@ -40,22 +40,45 @@ def _project() -> Project:
 @app.command()
 def init(
     name: Optional[str] = typer.Option(None, "--name", help="Project name."),
+    template: str = typer.Option(
+        "minimal", "--template", "-t", help="Starter template (see --list)."
+    ),
+    list_: bool = typer.Option(False, "--list", help="List available templates and exit."),
     force: bool = typer.Option(False, "--force", help="Overwrite existing scaffold."),
 ) -> None:
-    """Initialise a new project in the current directory."""
-    from .scaffold import init_project
+    """Initialise a new project in the current directory from a starter template."""
+    from .scaffold import init_project, list_templates
+
+    if list_:
+        typer.secho("Available templates:", bold=True)
+        for tname, desc in list_templates().items():
+            typer.echo(f"  {tname:<10} {desc}")
+        return
 
     root = Path.cwd()
     project_name = name or root.name
     try:
-        created = init_project(root, project_name, force=force)
+        created = init_project(root, project_name, template=template, force=force)
     except SmoketreeError as exc:
         _fail(str(exc))
         return
-    typer.secho(f"Initialised project '{project_name}' in {root}", fg=typer.colors.GREEN)
+    typer.secho(
+        f"Initialised '{project_name}' ({template} template) in {root}",
+        fg=typer.colors.GREEN,
+    )
     for path in created:
         typer.echo(f"  + {path.relative_to(root)}")
-    typer.echo("\nTry:  smoketree plan demo  &&  smoketree run demo")
+
+    hints = {
+        "minimal": "add a graph in graphs/ and a transformer in transformers/, then: "
+        "smoketree validate",
+        "demo": "smoketree run demo",
+        "fanout": "smoketree run fanout",
+        "tagged": "smoketree run tagged",
+        "portrait": "add sources/subject.jpg, pull your ollama models, then: "
+        "smoketree run portrait",
+    }
+    typer.echo(f"\nNext:  {hints.get(template, 'smoketree validate')}")
 
 
 @app.command()
