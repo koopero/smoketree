@@ -693,6 +693,7 @@ def _update_output_links(
             sources = resolver.produced_artifacts(node_id, first_output)
         except SmoketreeError:
             continue
+        fresh: set[Path] = set()
         for art in sources:
             ext = art.path.suffix
             if collection:
@@ -701,6 +702,26 @@ def _update_output_links(
             else:
                 link = project.outputs_dir / f"{graph.id}__{node_id}{ext}"
             _link_or_copy(art.path, link)
+            fresh.add(link)
+        _prune_stale_links(project, graph.id, node_id, fresh)
+
+
+def _prune_stale_links(
+    project: Project, graph_id: str, node_id: str, fresh: set[Path]
+) -> None:
+    """Remove this node's old output links that weren't recreated this run.
+
+    Keeps ``outputs/`` in sync when a node's instances change (e.g. after rewiring).
+    Only this node's links are touched — ``{graph}__{node}.ext`` or
+    ``{graph}__{node}__{hash}.ext`` — so partial runs don't disturb other nodes.
+    """
+    dot = f"{graph_id}__{node_id}."
+    grouped = f"{graph_id}__{node_id}__"
+    for existing in project.outputs_dir.iterdir():
+        name = existing.name
+        if (name.startswith(dot) or name.startswith(grouped)) and existing not in fresh:
+            if existing.is_symlink() or existing.is_file():
+                existing.unlink()
 
 
 def _link_or_copy(source: Path, link: Path) -> None:

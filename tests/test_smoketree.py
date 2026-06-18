@@ -562,6 +562,22 @@ def test_output_symlink_created(project: Project):
     assert link.exists()
 
 
+def test_stale_output_links_pruned(project: Project):
+    from smoketree.executor import run
+
+    graph = load_graph(project, "demo")
+    run(project, graph, take=0)
+    real = project.outputs_dir / "demo__stats.txt"
+    assert real.exists()
+    # simulate a stale link from an earlier instance of the same node
+    stale = project.outputs_dir / "demo__stats__deadbeef0000.txt"
+    stale.symlink_to(real.resolve())
+    assert stale.exists()
+    run(project, graph, take=0, force=True)
+    assert not stale.exists()        # stale per-node link pruned
+    assert real.exists()             # current link kept
+
+
 def test_output_flag_exports_non_terminal_node(project: Project):
     from smoketree.executor import run
 
