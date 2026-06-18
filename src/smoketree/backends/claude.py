@@ -7,21 +7,20 @@ text). The raw text response is written to the single declared output.
 
 from __future__ import annotations
 
-import base64
 from pathlib import Path
 
 from ..errors import ExecutionError
+from ..images import encode_image
 from ..models import ClaudeTransformer
 from ._prompt import build_prompt
 from .base import Backend, ExecutionContext
 
-_IMAGE_MEDIA_TYPES = {
-    "jpg": "image/jpeg",
-    "jpeg": "image/jpeg",
-    "png": "image/png",
-    "gif": "image/gif",
-    "webp": "image/webp",
-}
+
+def _resolve_max_edge(ctx: ExecutionContext) -> int:
+    override = getattr(ctx.transformer, "image_max_edge", None)
+    if override is not None:
+        return override
+    return ctx.project.config.defaults.image_max_edge
 
 
 class ClaudeBackend(Backend):
@@ -69,15 +68,12 @@ class ClaudeBackend(Backend):
         transformer = ctx.transformer
         assert isinstance(transformer, ClaudeTransformer)
         prompt, image_paths = build_prompt(transformer.prompt, ctx.inputs)
-        return prompt, [self._image_block(p) for p in image_paths]
+        max_edge = _resolve_max_edge(ctx)
+        return prompt, [self._image_block(p, max_edge) for p in image_paths]
 
     @staticmethod
-    def _image_block(path: Path) -> dict:
-        ext = path.suffix.lstrip(".").lower()
-        media_type = _IMAGE_MEDIA_TYPES.get(ext)
-        if media_type is None:
-            raise ExecutionError(f"Unsupported image format for Claude: '{ext}'.")
-        data = base64.standard_b64encode(path.read_bytes()).decode("ascii")
+    def _image_block(path: Path, max_edge: int) -> dict:
+        data, media_type = encode_image(path, max_edge)
         return {
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": data},

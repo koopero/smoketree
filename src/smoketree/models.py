@@ -27,6 +27,10 @@ class Defaults(BaseModel):
 
     comfyui_url: str = "http://localhost:8188"
     ollama_url: str = "http://localhost:11434"
+    # Downscale images sent to vision models to this long-edge cap (px), stripping
+    # metadata. 0 disables. ~1536 stays under Claude's limit and is ample for local
+    # vision models, while cutting payloads/token cost — especially for grouped inputs.
+    image_max_edge: int = 1536
     take: int = 0
 
 
@@ -152,6 +156,8 @@ class ClaudeTransformer(_BaseTransformer):
     max_tokens: int = 1024
     system: str | None = None
     prompt: str
+    # Override the project's image downscale cap (px long edge); 0 disables.
+    image_max_edge: int | None = None
 
 
 class OllamaTransformer(_BaseTransformer):
@@ -162,6 +168,8 @@ class OllamaTransformer(_BaseTransformer):
     # Toggle reasoning for thinking-capable models. Set false so the whole token
     # budget goes to the answer (thinking models otherwise return an empty response).
     think: bool | None = None
+    # Override the project's image downscale cap (px long edge); 0 disables.
+    image_max_edge: int | None = None
     # Passed through to Ollama's "options" (e.g. temperature, num_predict). The
     # deterministic Smoketree seed is injected as options.seed unless overridden here.
     options: dict[str, Any] = Field(default_factory=dict)

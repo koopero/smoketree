@@ -8,12 +8,12 @@ runs are reproducible. The raw response text is written to the single declared o
 
 from __future__ import annotations
 
-import base64
 from pathlib import Path
 
 import httpx
 
 from ..errors import ExecutionError
+from ..images import encode_image
 from ..models import OllamaTransformer
 from ._prompt import build_prompt
 from .base import Backend, ExecutionContext
@@ -81,9 +81,10 @@ class OllamaBackend(Backend):
         if transformer.think is not None:
             payload["think"] = transformer.think
         if image_paths:
-            payload["images"] = [_b64(p) for p in image_paths]
+            max_edge = (
+                transformer.image_max_edge
+                if transformer.image_max_edge is not None
+                else ctx.project.config.defaults.image_max_edge
+            )
+            payload["images"] = [encode_image(p, max_edge)[0] for p in image_paths]
         return payload
-
-
-def _b64(path: Path) -> str:
-    return base64.standard_b64encode(path.read_bytes()).decode("ascii")

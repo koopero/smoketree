@@ -210,9 +210,17 @@ def test_cache_key_stable_across_input_order():
 # --------------------------------------------------------------------------- #
 
 
+class _StubProject:
+    """Minimal stand-in for prompt/payload-assembly unit tests (resizing disabled)."""
+
+    class config:
+        class defaults:
+            image_max_edge = 0  # don't re-encode the tests' dummy image bytes
+
+
 def _ctx(tmp_path, transformer, inputs) -> ExecutionContext:
     return ExecutionContext(
-        project=None,  # type: ignore[arg-type]
+        project=_StubProject(),  # type: ignore[arg-type]
         graph_id="g",
         node_id="n",
         transformer=transformer,
@@ -787,6 +795,46 @@ def test_grouped_cache_is_per_group(grouped_project: Project):
     skips = [ln for ln in lines if ln.startswith("[SKIP]") and "combine" in ln]
     assert len(runs) == 1  # only alpha rebuilds
     assert len(skips) == 1  # beta stays cached
+
+
+def test_encode_image_downscales_and_caps(tmp_path):
+    import base64 as _b64
+    import io as _io
+
+    from PIL import Image
+
+    from smoketree.images import encode_image
+
+    big = tmp_path / "big.png"
+    Image.new("RGB", (3000, 2000), "blue").save(big)
+
+    # capped to long edge 1536, aspect preserved
+    data, media_type = encode_image(big, 1536)
+    assert media_type == "image/png"
+    with Image.open(_io.BytesIO(_b64.b64decode(data))) as im:
+        assert max(im.size) == 1536
+        assert im.size == (1536, 1024)
+
+    # max_edge=0 disables resizing -> original dimensions
+    data0, _ = encode_image(big, 0)
+    with Image.open(_io.BytesIO(_b64.b64decode(data0))) as im0:
+        assert im0.size == (3000, 2000)
+
+
+def test_encode_image_never_upscales(tmp_path):
+    import base64 as _b64
+    import io as _io
+
+    from PIL import Image
+
+    from smoketree.images import encode_image
+
+    small = tmp_path / "small.jpg"
+    Image.new("RGB", (200, 150), "red").save(small)
+    data, media_type = encode_image(small, 1536)
+    assert media_type == "image/jpeg"
+    with Image.open(_io.BytesIO(_b64.b64decode(data))) as im:
+        assert im.size == (200, 150)  # unchanged, not upscaled
 
 
 def test_build_prompt_multi_image(tmp_path):
