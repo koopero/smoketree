@@ -672,16 +672,18 @@ def _update_output_links(
     consumed = {
         ref.node_id for refs in graph.input_refs.values() for ref in refs.values()
     }
-    terminals = [
+    # Export terminal transforms by default, plus any node flagged `output: true`.
+    exported = [
         node_id
         for node_id in order
-        if graph.nodes[node_id].type == "transform" and node_id not in consumed
+        if graph.nodes[node_id].type == "transform"
+        and (node_id not in consumed or graph.nodes[node_id].output)
     ]
-    if not terminals:
+    if not exported:
         return
     project.outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    for node_id in terminals:
+    for node_id in exported:
         transformer = graph.transformers[node_id]
         if not transformer.outputs:
             continue

@@ -538,6 +538,20 @@ def test_output_symlink_created(project: Project):
     assert link.exists()
 
 
+def test_output_flag_exports_non_terminal_node(project: Project):
+    from smoketree.executor import run
+
+    # mark `shout` (a non-terminal node, consumed by reverse) as output: true
+    g = (project.graphs_dir / "demo.yaml").read_text().replace(
+        "    transformer: shout\n    inputs:\n      input: text\n",
+        "    transformer: shout\n    output: true\n    inputs:\n      input: text\n",
+    )
+    (project.graphs_dir / "demo.yaml").write_text(g)
+    run(project, load_graph(project, "demo"), take=0)
+    assert (project.outputs_dir / "demo__shout.txt").exists()   # forced export
+    assert (project.outputs_dir / "demo__stats.txt").exists()   # terminal still exported
+
+
 def test_take_changes_seed_and_dir(project: Project):
     from smoketree.executor import run
 

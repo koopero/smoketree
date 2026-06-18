@@ -89,6 +89,8 @@ class NodeDef(BaseModel):
     inputs: dict[str, InputValue] = Field(default_factory=dict)
     # fan-out strategy; required iff a transform consumes a collection input
     expand: ExpandStrategy | None = None
+    # force-export this node's outputs to outputs/ even if it isn't a terminal node
+    output: bool = False
 
 
 class GraphDef(BaseModel):
