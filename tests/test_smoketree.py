@@ -267,6 +267,31 @@ def test_force_rebuilds_everything(tmp_path: Path):
     assert enginelib.run(project, loaded, force=True) > 0
 
 
+def test_clean_rerun_skips_content_hash(tmp_path: Path, monkeypatch):
+    # The mtime+size fingerprint gates the content hash: a clean rerun (no input
+    # touched) must not re-read any input file.
+    project = _demo_project(tmp_path)
+    run(project)
+    reads: list = []
+    real = enginelib.hash_file
+    monkeypatch.setattr(enginelib, "hash_file", lambda p: reads.append(p) or real(p))
+    assert run(project) == 0
+    assert reads == []
+
+
+def test_identical_content_rewrite_does_not_rerun(tmp_path: Path):
+    # Rewriting a source with identical bytes moves its mtime (fingerprint miss) but
+    # leaves content unchanged, so the content-hash confirm holds and nothing reruns.
+    import os
+
+    project = _demo_project(tmp_path)
+    run(project)
+    src = tmp_path / "sources/episode/ep01/lines.txt"
+    src.write_text(src.read_text())
+    os.utime(src, (1e9, 1e9))  # force a distinctly different mtime
+    assert run(project) == 0
+
+
 def test_max_iterations_breaker(tmp_path: Path):
     # A rule whose output feeds its own input never converges: each pass discovers a new
     # path produced by the previous one. The circuit breaker must fire.
@@ -602,3 +627,126 @@ def test_replicate_backend_runs_via_engine(tmp_path: Path, monkeypatch):
     write(tmp_path, "work/alpha/prompt.txt", "hello prompt")
     run(project)
     assert (tmp_path / "work/alpha/portrait.png").read_bytes() == b"IMGBYTES"
+
+
+def test_claude_backend_runs_via_engine(tmp_path: Path, monkeypatch):
+    import sys
+    import types
+
+    captured = {}
+
+    class Block:
+        type = "text"
+
+        def __init__(self, text):
+            self.text = text
+
+    class Msg:
+        stop_reason = "end_turn"
+        stop_details = None
+
+        def __init__(self, text):
+            self.content = [Block(text)]
+
+    class FakeMessages:
+        def create(self, **kw):
+            captured.update(kw)
+            user_text = kw["messages"][0]["content"][0]["text"]
+            return Msg("CLAUDE:" + user_text)
+
+    class FakeAnthropic:
+        def __init__(self, *a, **k):
+            self.messages = FakeMessages()
+
+    fake = types.ModuleType("anthropic")
+    fake.Anthropic = FakeAnthropic
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: prompt\n    backend: claude\n"
+        '    in:\n      brief: "sources/{m}/brief.txt"\n'
+        '    out:\n      prompt: "work/{m}/prompt.txt"\n'
+        "    config:\n      model: claude-test\n      max_tokens: 64\n"
+        '      system: "SYS {m}"\n      prompt: "BRIEF={brief} KEY={m}"\n',
+    )
+    write(tmp_path, "sources/alpha/brief.txt", "a winged thing\n")
+    run(project)
+
+    out = (tmp_path / "work/alpha/prompt.txt").read_text()
+    assert out.startswith("CLAUDE:")
+    assert "a winged thing" in out and "KEY=alpha" in out
+    assert captured["model"] == "claude-test"
+    assert captured["max_tokens"] == 64
+    assert captured["system"] == "SYS alpha"
+
+
+def test_comfyui_backend_runs_via_engine(tmp_path: Path, monkeypatch):
+    submitted = {}
+
+    class FakeResp:
+        def __init__(self, *, status_code=200, payload=None, content=b""):
+            self.status_code = status_code
+            self._payload = payload
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, json=None, files=None, data=None):
+            if url == "/prompt":
+                submitted["workflow"] = json["prompt"]
+                return FakeResp(payload={"prompt_id": "pid"})
+            raise AssertionError(url)
+
+        def get(self, url, params=None):
+            if url == "/history/pid":
+                return FakeResp(
+                    payload={
+                        "pid": {
+                            "outputs": {"9": {"images": [{"filename": "out.png"}]}}
+                        }
+                    }
+                )
+            if url == "/view":
+                return FakeResp(content=b"PNGBYTES")
+            raise AssertionError(url)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("smoketree.backends.comfyui.httpx.Client", FakeClient)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: gen\n    backend: comfyui\n"
+        '    in:\n      text: "sources/{m}/p.txt"\n'
+        '    out:\n      image: "work/{m}/out.png"\n'
+        "    config:\n"
+        '      workflow: "wf.json"\n'
+        "      seed_inject: {node: \"3\", field: seed}\n"
+        "      inputs:\n        text: {node: \"6\", field: text}\n"
+        "      outputs:\n        image: {node: \"9\"}\n",
+    )
+    write(
+        tmp_path,
+        "wf.json",
+        '{"3": {"inputs": {"seed": 0}}, "6": {"inputs": {"text": ""}}, '
+        '"9": {"inputs": {}}}',
+    )
+    write(tmp_path, "sources/alpha/p.txt", "a prompt body")
+    run(project)
+
+    assert (tmp_path / "work/alpha/out.png").read_bytes() == b"PNGBYTES"
+    wf = submitted["workflow"]
+    assert wf["6"]["inputs"]["text"] == "a prompt body"  # text input injected
+    assert isinstance(wf["3"]["inputs"]["seed"], int)  # deterministic seed injected

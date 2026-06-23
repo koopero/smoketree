@@ -1,8 +1,13 @@
-"""Claude transformer backend: an Anthropic Messages API call.
+"""Claude backend (path core): an Anthropic Messages API call.
 
-Text and data inputs are inlined into the prompt at their ``{inputs.NAME}`` token.
-Image inputs are attached as image content blocks (the token is removed from the
-text). The raw text response is written to the single declared output.
+Reads its settings from the rule's ``config`` block: ``model`` (default
+``claude-opus-4-8``), ``prompt`` (required template), optional ``system``,
+``max_tokens`` (default 16000), and ``image_max_edge``. Text/data inputs are inlined
+into the prompt at their ``{name}`` token; image inputs are attached as image content
+blocks (for vision). The deterministic per-job seed is not used (the API is sampled).
+The raw text response is written to the single declared output.
+
+The API key comes from ``ANTHROPIC_API_KEY`` (read from the project's ``.env``).
 """
 
 from __future__ import annotations
@@ -11,64 +16,65 @@ from pathlib import Path
 
 from ..errors import ExecutionError
 from ..images import encode_image
-from ..models import ClaudeTransformer
-from ._prompt import build_prompt
+from ._prompt import render_prompt
 from .base import Backend, ExecutionContext
 
-
-def _resolve_max_edge(ctx: ExecutionContext) -> int:
-    override = getattr(ctx.transformer, "image_max_edge", None)
-    if override is not None:
-        return override
-    return ctx.project.config.defaults.image_max_edge
+_DEFAULT_MODEL = "claude-opus-4-8"
+_DEFAULT_MAX_TOKENS = 16000
 
 
 class ClaudeBackend(Backend):
-    def execute(self, ctx: ExecutionContext) -> dict[str, Path]:
-        transformer = ctx.transformer
-        assert isinstance(transformer, ClaudeTransformer)
-
-        if len(ctx.output_targets) != 1:
+    def execute(self, ctx: ExecutionContext) -> None:
+        cfg = ctx.config
+        if "prompt" not in cfg:
+            raise ExecutionError(f"Rule '{ctx.rule_name}': claude config needs a 'prompt'.")
+        if len(ctx.outputs) != 1:
             raise ExecutionError(
-                f"Claude transformer '{transformer.name}' must declare exactly one "
-                f"output (got {len(ctx.output_targets)})."
+                f"Rule '{ctx.rule_name}': claude needs exactly one output "
+                f"(got {len(ctx.outputs)})."
             )
-        output_name, target = next(iter(ctx.output_targets.items()))
+        target = next(iter(ctx.outputs.values()))
 
         prompt_text, image_blocks = self._build_prompt(ctx)
+        content: list[dict] = [{"type": "text", "text": prompt_text}, *image_blocks]
 
-        content: list[dict] = [{"type": "text", "text": prompt_text}]
-        content.extend(image_blocks)
-
-        try:
-            from anthropic import Anthropic
-        except ImportError as exc:  # pragma: no cover
-            raise ExecutionError(
-                "The 'anthropic' package is required for claude transformers."
-            ) from exc
+        from anthropic import Anthropic
 
         client = Anthropic()
         try:
             message = client.messages.create(
-                model=transformer.model,
-                max_tokens=transformer.max_tokens,
-                system=transformer.system or "",
+                model=cfg.get("model", _DEFAULT_MODEL),
+                max_tokens=cfg.get("max_tokens", _DEFAULT_MAX_TOKENS),
+                system=self._render_system(ctx),
                 messages=[{"role": "user", "content": content}],
             )
-        except Exception as exc:  # pragma: no cover - network/API failures
+        except Exception as exc:  # network/API failures
             raise ExecutionError(f"Claude API call failed: {exc}") from exc
 
-        text = "".join(
-            block.text for block in message.content if block.type == "text"
-        )
+        if message.stop_reason == "refusal":
+            raise ExecutionError(
+                f"Claude declined rule '{ctx.rule_name}' "
+                f"({getattr(message.stop_details, 'category', None)!r})."
+            )
+        text = "".join(b.text for b in message.content if b.type == "text")
+        if not text.strip():
+            raise ExecutionError(
+                f"Claude returned an empty response for rule '{ctx.rule_name}' "
+                f"(stop_reason={message.stop_reason!r}). Try raising max_tokens."
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
-        return {output_name: target}
+
+    def _render_system(self, ctx: ExecutionContext) -> str:
+        system = ctx.config.get("system")
+        if not system:
+            return ""
+        rendered, _ = render_prompt(system, ctx.inputs, ctx.keys)
+        return rendered
 
     def _build_prompt(self, ctx: ExecutionContext) -> tuple[str, list[dict]]:
-        transformer = ctx.transformer
-        assert isinstance(transformer, ClaudeTransformer)
-        prompt, image_paths = build_prompt(transformer.prompt, ctx.inputs)
-        max_edge = _resolve_max_edge(ctx)
+        prompt, image_paths = render_prompt(ctx.config["prompt"], ctx.inputs, ctx.keys)
+        max_edge = ctx.config.get("image_max_edge", ctx.project.config.defaults.image_max_edge)
         return prompt, [self._image_block(p, max_edge) for p in image_paths]
 
     @staticmethod

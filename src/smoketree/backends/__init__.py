@@ -1,13 +1,16 @@
 """Execution backends, dispatched by a rule's ``backend`` name.
 
-``shell``, ``ollama``, and ``replicate`` are ported onto the PathTree
-``ExecutionContext``. ``claude``/``comfyui`` remain on disk, dormant, until ported.
+All backends — ``shell``, ``ollama``, ``replicate``, ``claude``, and ``comfyui`` — are
+ported onto the PathTree ``ExecutionContext`` and read their settings from the rule's
+``config`` block (except ``shell``, which uses the rendered ``run`` command).
 """
 
 from __future__ import annotations
 
 from ..errors import ExecutionError
 from .base import Backend, ExecutionContext
+from .claude import ClaudeBackend
+from .comfyui import ComfyUIBackend
 from .ollama import OllamaBackend
 from .replicate import ReplicateBackend
 from .shell import ShellBackend
@@ -16,6 +19,8 @@ _BACKENDS: dict[str, type[Backend]] = {
     "shell": ShellBackend,
     "ollama": OllamaBackend,
     "replicate": ReplicateBackend,
+    "claude": ClaudeBackend,
+    "comfyui": ComfyUIBackend,
 }
 
 

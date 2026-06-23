@@ -1,8 +1,14 @@
-"""ComfyUI transformer backend: inject inputs into a workflow, submit, collect.
+"""ComfyUI backend (path core): inject inputs into a workflow, submit, collect.
 
-The workflow JSON (exported from ComfyUI in API format) is loaded, declared input
-fields are replaced, the prompt is submitted over the HTTP API, and produced files
-are polled from history and downloaded to the output target.
+Reads its settings from the rule's ``config`` block:
+  workflow      path to a workflow JSON (API format), relative to the project root  (required)
+  seed_inject   {node, field}: write the per-job seed into this workflow node field  (optional)
+  inputs        {name: {node, field}}: inject input ``name`` into that node field
+  outputs       {name: {node}}: collect the first image produced by that node
+
+Each declared input is injected by media: an image is uploaded and its server-side name
+written to the field; text/data is read and its text written. Produced images are polled
+from history and downloaded to the rule's declared output paths.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ from pathlib import Path
 import httpx
 
 from ..errors import ExecutionError
-from ..models import ComfyUITransformer
+from ..media import infer_media
 from .base import Backend, ExecutionContext
 
 _POLL_INTERVAL = 1.0
@@ -24,25 +30,26 @@ _POLL_TIMEOUT = 600.0
 
 
 class ComfyUIBackend(Backend):
-    def execute(self, ctx: ExecutionContext) -> dict[str, Path]:
-        transformer = ctx.transformer
-        assert isinstance(transformer, ComfyUITransformer)
-
-        base_url = str(ctx.project.config.defaults.comfyui_url).rstrip("/")
-        workflow_path = ctx.project.transformers_dir / transformer.workflow
-        if not workflow_path.exists():
+    def execute(self, ctx: ExecutionContext) -> None:
+        cfg = ctx.config
+        workflow_rel = cfg.get("workflow")
+        if not workflow_rel:
             raise ExecutionError(
-                f"ComfyUI workflow not found: {workflow_path}."
+                f"Rule '{ctx.rule_name}': comfyui config needs a 'workflow' path."
             )
+        workflow_path = ctx.project.root / workflow_rel
+        if not workflow_path.exists():
+            raise ExecutionError(f"ComfyUI workflow not found: {workflow_path}.")
         workflow = _node_dict(json.loads(workflow_path.read_text()))
 
+        base_url = str(ctx.project.config.defaults.comfyui_url).rstrip("/")
         client = httpx.Client(base_url=base_url, timeout=30.0)
         client_id = str(uuid.uuid4())
         try:
             self._inject_inputs(client, workflow, ctx)
             prompt_id = self._submit(client, workflow, client_id)
             history = self._poll_history(client, prompt_id)
-            return self._collect_outputs(client, history, ctx)
+            self._collect_outputs(client, history, ctx)
         except httpx.HTTPError as exc:
             raise ExecutionError(f"ComfyUI request failed: {exc}") from exc
         finally:
@@ -51,54 +58,41 @@ class ComfyUIBackend(Backend):
     def _inject_inputs(
         self, client: httpx.Client, workflow: dict, ctx: ExecutionContext
     ) -> None:
-        transformer = ctx.transformer
-        assert isinstance(transformer, ComfyUITransformer)
+        cfg = ctx.config
 
-        seed_inject = transformer.seed_inject
-        if seed_inject is not None:
-            node = workflow.get(seed_inject.node_id)
-            if node is None or "inputs" not in node:
-                raise ExecutionError(
-                    f"Workflow has no node '{seed_inject.node_id}' with inputs "
-                    f"(for seed_inject)."
-                )
-            node["inputs"][seed_inject.field] = ctx.seed
+        seed_inject = cfg.get("seed_inject")
+        if seed_inject:
+            node = _node(workflow, seed_inject["node"], "seed_inject")
+            node["inputs"][seed_inject["field"]] = ctx.seed
 
-        for name, spec in transformer.inputs.items():
-            inject = spec.inject
-            if inject is None:
+        for name, spec in cfg.get("inputs", {}).items():
+            value = ctx.inputs.get(name)
+            if value is None:
                 raise ExecutionError(
-                    f"ComfyUI input '{name}' is missing an 'inject' spec."
+                    f"Rule '{ctx.rule_name}': comfyui config injects input '{name}', "
+                    f"but the rule declares no such input."
                 )
-            artifact = ctx.inputs[name]
-            if isinstance(artifact, list):
+            if isinstance(value, list):
                 raise ExecutionError(
                     f"ComfyUI input '{name}' received a multi-file (grouped) input; "
                     f"ComfyUI injection supports a single file per input."
                 )
-            node = workflow.get(inject.node_id)
-            if node is None or "inputs" not in node:
-                raise ExecutionError(
-                    f"Workflow has no node '{inject.node_id}' with inputs "
-                    f"(for input '{name}')."
-                )
-            if spec.media == "image":
-                value: object = self._upload_image(client, artifact.path)
-            elif spec.media in ("text", "data"):
-                value = artifact.path.read_text()
+            node = _node(workflow, spec["node"], f"input '{name}'")
+            media = infer_media(value)
+            if media == "image":
+                node["inputs"][spec["field"]] = self._upload_image(client, value)
+            elif media in ("text", "data"):
+                node["inputs"][spec["field"]] = value.read_text()
             else:
                 raise ExecutionError(
-                    f"ComfyUI cannot inject media type '{spec.media}' "
-                    f"(input '{name}')."
+                    f"ComfyUI cannot inject media '{media}' ({value}) for input '{name}'."
                 )
-            node["inputs"][inject.field] = value
 
     def _upload_image(self, client: httpx.Client, path: Path) -> str:
         data = path.read_bytes()
         # Content-addressed upload name: ComfyUI's LoadImage caches by filename across
-        # prompts, so reusing a generic name (every node's output is "image.png") would
-        # serve a stale/wrong image to later cells. A content hash keeps distinct images
-        # distinct and dedupes identical ones.
+        # prompts, so reusing a generic name would serve a stale image to later jobs. A
+        # content hash keeps distinct images distinct and dedupes identical ones.
         name = f"smoketree_{hashlib.sha256(data).hexdigest()[:16]}{path.suffix.lower()}"
         files = {"image": (name, data)}
         resp = client.post("/upload/image", files=files, data={"overwrite": "true"})
@@ -126,39 +120,31 @@ class ComfyUIBackend(Backend):
                 return history[prompt_id]
             time.sleep(_POLL_INTERVAL)
         raise ExecutionError(
-            f"Timed out after {_POLL_TIMEOUT:.0f}s waiting for ComfyUI prompt "
-            f"{prompt_id}."
+            f"Timed out after {_POLL_TIMEOUT:.0f}s waiting for ComfyUI prompt {prompt_id}."
         )
 
     def _collect_outputs(
         self, client: httpx.Client, history: dict, ctx: ExecutionContext
-    ) -> dict[str, Path]:
-        transformer = ctx.transformer
-        assert isinstance(transformer, ComfyUITransformer)
+    ) -> None:
+        outputs_cfg = ctx.config.get("outputs", {})
         node_outputs = history.get("outputs", {})
-        produced: dict[str, Path] = {}
-        for name, spec in transformer.outputs.items():
-            collect = spec.collect
-            if collect is None:
+        for name, target in ctx.outputs.items():
+            spec = outputs_cfg.get(name)
+            if spec is None:
                 raise ExecutionError(
-                    f"ComfyUI output '{name}' is missing a 'collect' spec."
+                    f"Rule '{ctx.rule_name}': comfyui config has no 'outputs.{name}' "
+                    f"collect spec for declared output '{name}'."
                 )
-            node_output = node_outputs.get(collect.node_id)
+            node_output = node_outputs.get(spec["node"])
             images = (node_output or {}).get("images") or []
             if not images:
                 raise ExecutionError(
-                    f"ComfyUI node '{collect.node_id}' produced no images "
+                    f"ComfyUI node '{spec['node']}' produced no images "
                     f"(for output '{name}')."
                 )
-            image = images[0]
-            data = self._download(client, image)
-            ext = Path(image["filename"]).suffix or (
-                f".{spec.format}" if spec.format else ".png"
-            )
-            target = ctx.output_targets[name].with_suffix(ext)
+            data = self._download(client, images[0])
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
-            produced[name] = target
-        return produced
 
     def _download(self, client: httpx.Client, image: dict) -> bytes:
         resp = client.get(
@@ -171,6 +157,15 @@ class ComfyUIBackend(Backend):
         )
         resp.raise_for_status()
         return resp.content
+
+
+def _node(workflow: dict, node_id: str, context: str) -> dict:
+    node = workflow.get(node_id)
+    if node is None or "inputs" not in node:
+        raise ExecutionError(
+            f"Workflow has no node '{node_id}' with inputs (for {context})."
+        )
+    return node
 
 
 def _node_dict(workflow: dict) -> dict:
