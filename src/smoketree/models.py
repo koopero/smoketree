@@ -1,8 +1,10 @@
-"""Pydantic models for project config, graphs, and transformers.
+"""Pydantic models for project config, pipelines (rules), and transformers.
 
-These define the internal data model. Parsed YAML is validated into these
-shapes; runtime resolution (topological order, artifact paths) is layered on top in
-``graph.py`` and ``executor.py``.
+The PathTree core models a pipeline as a list of **rules**. A rule binds input
+path-patterns to output path-patterns and a shell command; the DAG is inferred and
+fan-out comes from the ``{key}`` axes discovered by globbing the tree (see ``bind.py``
+and ``engine.py``). The ``Transformer`` union below is retained, dormant, for a later
+slice that ports the non-shell backends onto this core.
 """
 
 from __future__ import annotations
@@ -13,8 +15,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 MediaType = Literal["image", "audio", "video", "text", "data", "latent"]
 MEDIA_TYPES: tuple[str, ...] = ("image", "audio", "video", "text", "data", "latent")
-
-ExpandStrategy = Literal["product", "zip", "each"]
 
 
 # --------------------------------------------------------------------------- #
@@ -27,11 +27,10 @@ class Defaults(BaseModel):
 
     comfyui_url: str = "http://localhost:8188"
     ollama_url: str = "http://localhost:11434"
-    # Downscale images sent to vision models to this long-edge cap (px), stripping
-    # metadata. 0 disables. ~1536 stays under Claude's limit and is ample for local
-    # vision models, while cutting payloads/token cost — especially for grouped inputs.
     image_max_edge: int = 1536
-    take: int = 0
+    # Fixpoint circuit breaker: a single `run` performs at most this many passes
+    # before erroring. Guards a runaway rule from re-invoking paid transforms forever.
+    max_iterations: int = 100
 
 
 class ProjectConfig(BaseModel):
@@ -43,69 +42,66 @@ class ProjectConfig(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Graph definition
+# Pipeline definition (rules)
 # --------------------------------------------------------------------------- #
 
 
-class CollectionSource(BaseModel):
-    """One explicitly-declared, optionally-tagged item of a collection node."""
+class FeedbackSpec(BaseModel):
+    """A feedback channel attached to an (output) rule.
+
+    ``append`` is a path-pattern (keyed by a subset of the rule's keys) for a
+    human-authored notes file that smoketree **seeds** once per discovered key-tuple
+    (placeholder ``(no feedback yet)``) and thereafter never clobbers. The render rule
+    that declares it *owns* the channel; a separate compile rule typically reads the
+    file and turns the notes into a directive. Notes are meant to accumulate (append).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    path: str
-    tags: list[str] = Field(default_factory=list)
+    append: str
 
 
-class InputDecl(BaseModel):
-    """Long-form input declaration: ``{node: ..., filter_tag: ...}``."""
+class Rule(BaseModel):
+    """One transform: input path-pattern(s) -> output path-pattern(s) + a command.
 
-    model_config = ConfigDict(extra="forbid")
+    Patterns may contain ``{key}`` axes (one path segment, also a command variable)
+    and plain ``*`` / ``**`` globs. An input pattern containing a glob makes that input
+    a *list* (the globbed axis collapses); a pattern with only keys is a *scalar*. An
+    ``out`` pattern carrying a key that no ``in`` binds is a *scatter* — the command
+    writes a runtime-determined set under the owned directory prefix.
+    """
 
-    node: str
-    filter_tag: str | None = None
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-
-# An input value is either a string ("node", "node.output", or the "node[tag]"
-# shorthand) or the long-form mapping.
-InputValue = Union[str, InputDecl]
-
-
-class NodeDef(BaseModel):
-    """A node as declared in a graph YAML file (before resolution)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["source", "transform", "collection"]
-    # source nodes:
-    path: str | None = None
-    # collection nodes (exactly one of glob / sources):
-    glob: str | None = None
-    sources: list[CollectionSource] | None = None
-    # collection nodes (glob only): group matched files into one item per subdirectory,
-    # so a consuming transform runs once per group with the whole group as a multi-file input
-    group_by: Literal["parent"] | None = None
-    # transform nodes:
-    transformer: str | None = None
-    inputs: dict[str, InputValue] = Field(default_factory=dict)
-    # fan-out strategy; required iff a transform consumes a collection input
-    expand: ExpandStrategy | None = None
-    # force-export this node's outputs to outputs/ even if it isn't a terminal node
-    output: bool = False
-    # generate this node's output once into a user-owned dir (scenes/), then treat it as
-    # an editable source of truth: never overwrite it, hash its current content for
-    # downstream, regenerate only if missing or --force. Requires exactly one output.
-    materialize: bool = False
+    name: str
+    in_: dict[str, str] = Field(default_factory=dict, alias="in")
+    out: dict[str, str] = Field(default_factory=dict)
+    backend: str = "shell"
+    # set false to turn a rule (a whole stage) off without deleting it: it never binds,
+    # runs, seeds its feedback, or surfaces in the workspace. Flip back to re-enable.
+    enabled: bool = True
+    # a human-feedback channel attached to this rule's output (seeded, never clobbered)
+    feedback: FeedbackSpec | None = None
+    # shell backend: the command template. Required for backend=shell, ignored otherwise.
+    run: str | None = None
+    # non-shell backends (ollama, replicate, ...): backend-specific settings — model,
+    # prompt/system templates, params, seed_field, per-input field maps, etc. The backend
+    # interprets it. Template strings reference inputs/keys by {name}.
+    config: dict[str, Any] = Field(default_factory=dict)
+    # delete managed, key-scoped children under this rule's owned prefix that vanish
+    # from the regenerated set (scatter GC). Scoped to the binding.
+    prune: bool = False
 
 
-class GraphDef(BaseModel):
+class Pipeline(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    nodes: dict[str, NodeDef]
+    rules: list[Rule] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
-# Transformer definitions
+# Transformer definitions (dormant — retained for a later backend-port slice)
 # --------------------------------------------------------------------------- #
 
 
@@ -128,8 +124,9 @@ class InputSpec(BaseModel):
 
     type: Literal["file"] = "file"
     media: MediaType
-    # comfyui-only: where to inject this input into the workflow JSON
     inject: ComfyInject | None = None
+    field: str | None = None
+    array: bool = False
 
 
 class OutputSpec(BaseModel):
@@ -138,7 +135,6 @@ class OutputSpec(BaseModel):
     type: Literal["file"] = "file"
     media: MediaType
     format: str | None = None
-    # comfyui-only: which workflow node produces this output
     collect: ComfyCollect | None = None
 
 
@@ -162,7 +158,6 @@ class ClaudeTransformer(_BaseTransformer):
     max_tokens: int = 1024
     system: str | None = None
     prompt: str
-    # Override the project's image downscale cap (px long edge); 0 disables.
     image_max_edge: int | None = None
 
 
@@ -171,27 +166,26 @@ class OllamaTransformer(_BaseTransformer):
     model: str
     system: str | None = None
     prompt: str
-    # Toggle reasoning for thinking-capable models. Set false so the whole token
-    # budget goes to the answer (thinking models otherwise return an empty response).
     think: bool | None = None
-    # Override the project's image downscale cap (px long edge); 0 disables.
     image_max_edge: int | None = None
-    # Passed through to Ollama's "options" (e.g. temperature, num_predict). The
-    # deterministic Smoketree seed is injected as options.seed unless overridden here.
     options: dict[str, Any] = Field(default_factory=dict)
 
 
 class ComfyUITransformer(_BaseTransformer):
     type: Literal["comfyui"]
     workflow: str
-    # Optional: inject the deterministic per-take seed into a workflow node (e.g. a
-    # KSampler's "seed" field) so different takes produce different generations.
     seed_inject: ComfyInject | None = None
 
 
-class HTTPTransformer(_BaseTransformer):
-    """Generic HTTP request transformer (future work; parsed but not executable)."""
+class ReplicateTransformer(_BaseTransformer):
+    type: Literal["replicate"]
+    model: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    seed_field: str | None = None
+    image_max_edge: int | None = None
 
+
+class HTTPTransformer(_BaseTransformer):
     model_config = ConfigDict(extra="allow")
 
     type: Literal["http"]
@@ -203,6 +197,7 @@ Transformer = Annotated[
         ClaudeTransformer,
         OllamaTransformer,
         ComfyUITransformer,
+        ReplicateTransformer,
         HTTPTransformer,
     ],
     Field(discriminator="type"),

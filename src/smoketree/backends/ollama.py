@@ -1,42 +1,41 @@
-"""Ollama transformer backend: a local LLM call over Ollama's HTTP API.
+"""Ollama backend (path core): a local LLM call over Ollama's HTTP API.
 
-Mirrors the Claude backend for local-first inference. Text/data inputs are inlined into
-the prompt; image inputs are sent as base64 in the ``images`` array (for vision models
-such as ``llava``). The deterministic Smoketree seed is injected as ``options.seed`` so
-runs are reproducible. The raw response text is written to the single declared output.
+Reads its settings from the rule's ``config`` block: ``model`` (required),
+``prompt`` (required template), optional ``system``, ``options``, ``think``, and
+``image_max_edge``. Text/data inputs are inlined into the prompt; image inputs are sent
+as base64 in the ``images`` array (for vision models). The deterministic per-job seed is
+injected as ``options.seed``. The response text is written to the single declared output.
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import httpx
 
 from ..errors import ExecutionError
 from ..images import encode_image
-from ..models import OllamaTransformer
-from ._prompt import build_prompt
+from ._prompt import render_prompt
 from .base import Backend, ExecutionContext
 
-# Local generation can be slow on cold model loads; allow a generous read timeout.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
 
 
 class OllamaBackend(Backend):
-    def execute(self, ctx: ExecutionContext) -> dict[str, Path]:
-        transformer = ctx.transformer
-        assert isinstance(transformer, OllamaTransformer)
-
-        if len(ctx.output_targets) != 1:
+    def execute(self, ctx: ExecutionContext) -> None:
+        cfg = ctx.config
+        model = cfg.get("model")
+        if not model:
+            raise ExecutionError(f"Rule '{ctx.rule_name}': ollama config needs a 'model'.")
+        if "prompt" not in cfg:
+            raise ExecutionError(f"Rule '{ctx.rule_name}': ollama config needs a 'prompt'.")
+        if len(ctx.outputs) != 1:
             raise ExecutionError(
-                f"Ollama transformer '{transformer.name}' must declare exactly one "
-                f"output (got {len(ctx.output_targets)})."
+                f"Rule '{ctx.rule_name}': ollama needs exactly one output "
+                f"(got {len(ctx.outputs)})."
             )
-        output_name, target = next(iter(ctx.output_targets.items()))
+        target = next(iter(ctx.outputs.values()))
 
         payload = self._build_payload(ctx)
         base_url = str(ctx.project.config.defaults.ollama_url).rstrip("/")
-
         try:
             with httpx.Client(base_url=base_url, timeout=_TIMEOUT) as client:
                 resp = client.post("/api/generate", json=payload)
@@ -45,46 +44,38 @@ class OllamaBackend(Backend):
         except httpx.HTTPError as exc:
             raise ExecutionError(
                 f"Ollama request to {base_url} failed: {exc}. "
-                f"Is Ollama running and is model '{transformer.model}' pulled?"
+                f"Is Ollama running and is model '{model}' pulled?"
             ) from exc
 
         text = body.get("response", "")
         if not text.strip():
             raise ExecutionError(
-                f"Ollama model '{transformer.model}' returned an empty response "
-                f"(done_reason={body.get('done_reason')!r}, "
-                f"eval_count={body.get('eval_count')}). "
-                f"Try a different seed (--take N), raising options.num_predict, "
-                f"or a different model."
+                f"Ollama model '{model}' returned an empty response "
+                f"(done_reason={body.get('done_reason')!r}). Try raising "
+                f"options.num_predict or a different model."
             )
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
-        return {output_name: target}
 
     def _build_payload(self, ctx: ExecutionContext) -> dict:
-        transformer = ctx.transformer
-        assert isinstance(transformer, OllamaTransformer)
+        cfg = ctx.config
+        prompt, image_paths = render_prompt(cfg["prompt"], ctx.inputs, ctx.keys)
 
-        prompt, image_paths = build_prompt(transformer.prompt, ctx.inputs)
-
-        # Inject the deterministic seed unless the transformer set one explicitly.
-        options = dict(transformer.options)
+        options = dict(cfg.get("options", {}))
         options.setdefault("seed", ctx.seed)
 
         payload: dict = {
-            "model": transformer.model,
+            "model": cfg["model"],
             "prompt": prompt,
             "stream": False,
             "options": options,
         }
-        if transformer.system:
-            payload["system"] = transformer.system
-        if transformer.think is not None:
-            payload["think"] = transformer.think
+        if cfg.get("system"):
+            system, _ = render_prompt(cfg["system"], ctx.inputs, ctx.keys)
+            payload["system"] = system
+        if cfg.get("think") is not None:
+            payload["think"] = cfg["think"]
         if image_paths:
-            max_edge = (
-                transformer.image_max_edge
-                if transformer.image_max_edge is not None
-                else ctx.project.config.defaults.image_max_edge
-            )
+            max_edge = cfg.get("image_max_edge", ctx.project.config.defaults.image_max_edge)
             payload["images"] = [encode_image(p, max_edge)[0] for p in image_paths]
         return payload

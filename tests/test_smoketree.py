@@ -1,1230 +1,604 @@
-"""Tests for Smoketree's parsing, caching, and backend logic."""
+"""Tests for the PathTree core: binding, the fixpoint engine, staleness, and prune."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 
-from smoketree import cache as cachelib
-from smoketree.backends.base import ExecutionContext
-from smoketree.backends.claude import ClaudeBackend
-from smoketree.backends.comfyui import ComfyUIBackend
-from smoketree.backends.ollama import OllamaBackend
-from smoketree.cache import Artifact
-from smoketree.errors import SmoketreeError, ValidationError
-from smoketree.graph import load_graph
+from smoketree import engine as enginelib
+from smoketree.bind import Pattern, bind_rule
+from smoketree.errors import ExecutionError, SmoketreeError, ValidationError
 from smoketree.loader import substitute_env
-from smoketree.models import (
-    ClaudeTransformer,
-    ComfyCollect,
-    ComfyInject,
-    ComfyUITransformer,
-    InputSpec,
-    OllamaTransformer,
-    OutputSpec,
-)
+from smoketree.models import Pipeline, Rule
 from smoketree.project import Project
+from smoketree.rules import infer_dependencies, load_pipeline
 from smoketree.scaffold import init_project
 
 
-@pytest.fixture
-def project(tmp_path: Path) -> Project:
-    # The "demo" template provides the `shout` transformer + textproc script that
-    # most graph/collection tests build on, plus the demo graph itself.
-    init_project(tmp_path, "test-proj", template="demo")
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def make_project(tmp_path: Path, pipeline_yaml: str, name: str = "p") -> Project:
+    init_project(tmp_path, name, template="minimal")
+    (tmp_path / "graphs").mkdir(exist_ok=True)
+    (tmp_path / "graphs" / "g.yaml").write_text(pipeline_yaml)
     return Project(tmp_path)
 
 
+def write(root: Path, rel: str, content: str = "x\n") -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return path
+
+
+def run(project: Project) -> int:
+    loaded = load_pipeline(project, "g")
+    return enginelib.run(project, loaded)
+
+
+def rule(name, in_, out, run, prune=False) -> Rule:
+    return Rule(name=name, **{"in": in_}, out=out, run=run, prune=prune)
+
+
 # --------------------------------------------------------------------------- #
-# Loader
+# Pattern compilation
 # --------------------------------------------------------------------------- #
 
 
-def test_scaffold_writes_instructions(project: Project):
-    instructions = project.root / "INSTRUCTIONS.md"
-    assert instructions.exists()
-    assert "Smoketree project" in instructions.read_text()
+def test_pattern_keys_and_glob_classification():
+    scalar = Pattern.compile("a/{x}/{y}/f.txt")
+    assert scalar.keys == ["x", "y"]
+    assert scalar.has_glob is False
+
+    listy = Pattern.compile("a/{x}/seg/*/f.txt")
+    assert listy.keys == ["x"]
+    assert listy.has_glob is True
+
+
+def test_pattern_fill_and_regex():
+    pat = Pattern.compile("a/{x}/f.txt")
+    assert pat.fill({"x": "ep1"}) == "a/ep1/f.txt"
+    m = pat.regex.match("a/ep1/f.txt")
+    assert m and m.group("x") == "ep1"
+    assert pat.regex.match("a/ep1/sub/f.txt") is None  # {x} is one segment
+
+
+def test_pattern_duplicate_key_rejected():
+    with pytest.raises(ValidationError):
+        Pattern.compile("a/{x}/{x}/f.txt")
 
 
 # --------------------------------------------------------------------------- #
-# init templates
+# Binding: map, product, join, pool, scatter
 # --------------------------------------------------------------------------- #
 
 
-def test_init_default_is_minimal(tmp_path: Path):
-    init_project(tmp_path, "p")  # default template
-    assert (tmp_path / "smoketree.yaml").exists()
-    assert (tmp_path / "INSTRUCTIONS.md").exists()
-    # standard dirs exist but no example graphs
-    assert (tmp_path / "graphs").is_dir()
-    assert (tmp_path / "transformers").is_dir()
-    assert not list((tmp_path / "graphs").glob("*.yaml"))
+def test_bind_map_one_job_per_key(tmp_path: Path):
+    write(tmp_path, "in/a/f.txt")
+    write(tmp_path, "in/b/f.txt")
+    r = rule("r", {"src": "in/{k}/f.txt"}, {"dst": "out/{k}/f.txt"}, "cp {src} {dst}")
+    bindings = bind_rule(tmp_path, r)
+    assert {b.keys["k"] for b in bindings} == {"a", "b"}
+    assert all(isinstance(b.inputs["src"], Path) for b in bindings)
 
 
-def test_init_substitutes_project_name(tmp_path: Path):
-    init_project(tmp_path, "my-cool-proj")
-    config = (tmp_path / "smoketree.yaml").read_text()
-    assert "name: my-cool-proj" in config
-    assert "__PROJECT_NAME__" not in config
+def test_bind_cross_product(tmp_path: Path):
+    write(tmp_path, "city/tokyo.txt")
+    write(tmp_path, "city/osaka.txt")
+    write(tmp_path, "kaiju/godzilla.txt")
+    r = rule("r", {"c": "city/{city}.txt", "k": "kaiju/{kaiju}.txt"},
+             {"o": "out/{city}/{kaiju}.txt"}, "cat {c} {k} > {o}")
+    bindings = bind_rule(tmp_path, r)
+    assert {(b.keys["city"], b.keys["kaiju"]) for b in bindings} == {
+        ("tokyo", "godzilla"), ("osaka", "godzilla"),
+    }
 
 
-def test_init_template_demo(tmp_path: Path):
-    init_project(tmp_path, "p", template="demo")
-    assert (tmp_path / "graphs" / "demo.yaml").exists()
-    assert (tmp_path / "transformers" / "shout.yaml").exists()
-    assert (tmp_path / "scripts" / "textproc.py").exists()
+def test_bind_shared_key_joins(tmp_path: Path):
+    write(tmp_path, "a/ep1.txt")
+    write(tmp_path, "a/ep2.txt")
+    write(tmp_path, "b/ep1.txt")  # ep2 missing on the b side
+    r = rule("r", {"x": "a/{ep}.txt", "y": "b/{ep}.txt"}, {"o": "out/{ep}.txt"},
+             "cat {x} {y} > {o}")
+    bindings = bind_rule(tmp_path, r)
+    assert {b.keys["ep"] for b in bindings} == {"ep1"}  # only the aligned pair
 
 
-def test_init_template_portrait(tmp_path: Path):
-    init_project(tmp_path, "p", template="portrait")
-    assert (tmp_path / "graphs" / "portrait.yaml").exists()
-    txt2img = (tmp_path / "transformers" / "txt2img.yaml").read_text()
-    assert "seed_inject" in txt2img  # demonstrates the seed injection feature
+def test_bind_pool_collapses_glob_axis(tmp_path: Path):
+    write(tmp_path, "ep/e1/seg/00/x.txt")
+    write(tmp_path, "ep/e1/seg/01/x.txt")
+    write(tmp_path, "ep/e2/seg/00/x.txt")
+    r = rule("r", {"parts": "ep/{ep}/seg/*/x.txt"}, {"o": "ep/{ep}/sum.txt"},
+             "cat {parts} > {o}")
+    bindings = bind_rule(tmp_path, r)
+    by_ep = {b.keys["ep"]: b for b in bindings}
+    assert set(by_ep) == {"e1", "e2"}
+    assert isinstance(by_ep["e1"].inputs["parts"], list)
+    assert len(by_ep["e1"].inputs["parts"]) == 2
 
 
-def test_init_unknown_template_errors(tmp_path: Path):
-    with pytest.raises(SmoketreeError, match="Unknown template"):
-        init_project(tmp_path, "p", template="nope")
+def test_bind_missing_input_yields_no_binding(tmp_path: Path):
+    r = rule("r", {"src": "in/{k}/f.txt"}, {"dst": "out/{k}.txt"}, "cp {src} {dst}")
+    assert bind_rule(tmp_path, r) == []
 
 
-def test_list_templates():
-    from smoketree.scaffold import list_templates
+def test_bind_scatter_resolves_owned_prefix(tmp_path: Path):
+    write(tmp_path, "src/e1.txt")
+    r = rule("r", {"s": "src/{ep}.txt"}, {"segs": "work/{ep}/seg/{segment}/f.txt"},
+             "split {s} {segs}", prune=True)
+    [b] = bind_rule(tmp_path, r)
+    assert b.is_scatter
+    assert b.outputs["segs"] == tmp_path / "work/e1/seg"
+    assert b.enumerable_outputs == []
+    assert str(tmp_path / "work/e1/seg") in b.command
 
-    templates = list_templates()
-    assert "minimal" in templates
-    assert "portrait" in templates
-    assert all(isinstance(v, str) for v in templates.values())
+
+# --------------------------------------------------------------------------- #
+# Validation
+# --------------------------------------------------------------------------- #
+
+
+def test_unknown_command_variable_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        'name: g\nrules:\n  - name: r\n    in:\n      a: "src/{k}.txt"\n'
+        '    out:\n      b: "out/{k}.txt"\n    run: "cp {a} {nope}"\n',
+    )
+    with pytest.raises(SmoketreeError):
+        load_pipeline(project, "g")
+
+
+def test_duplicate_rule_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        'name: g\nrules:\n'
+        '  - name: r\n    in:\n      a: "x/{k}.txt"\n    out:\n      b: "o/{k}.txt"\n    run: "cp {a} {b}"\n'
+        '  - name: r\n    in:\n      a: "y/{k}.txt"\n    out:\n      b: "p/{k}.txt"\n    run: "cp {a} {b}"\n',
+    )
+    with pytest.raises(SmoketreeError):
+        load_pipeline(project, "g")
+
+
+def test_infer_dependencies_links_producer_to_consumer():
+    pipeline = Pipeline.model_validate({
+        "name": "g",
+        "rules": [
+            {"name": "a", "in": {"s": "src/{k}.txt"}, "out": {"o": "mid/{k}.txt"},
+             "run": "cp {s} {o}"},
+            {"name": "b", "in": {"m": "mid/{k}.txt"}, "out": {"o": "out/{k}.txt"},
+             "run": "cp {m} {o}"},
+        ],
+    })
+    deps = infer_dependencies(pipeline)
+    assert deps["b"] == {"a"}
+    assert deps["a"] == set()
+
+
+# --------------------------------------------------------------------------- #
+# Engine: fixpoint, staleness, prune
+# --------------------------------------------------------------------------- #
+
+
+DEMO = (
+    "name: g\n"
+    "rules:\n"
+    "  - name: split\n"
+    '    in:\n      lines: "sources/episode/{episode}/lines.txt"\n'
+    '    out:\n      segments: "work/episode/{episode}/segment/{segment}/line.txt"\n'
+    '    run: "python scripts/split.py {lines} {segments}"\n'
+    "    prune: true\n"
+    "  - name: shout\n"
+    '    in:\n      line: "work/episode/{episode}/segment/{segment}/line.txt"\n'
+    '    out:\n      loud: "work/episode/{episode}/segment/{segment}/loud.txt"\n'
+    '    run: "tr a-z A-Z < {line} > {loud}"\n'
+    "  - name: summary\n"
+    '    in:\n      parts: "work/episode/{episode}/segment/*/loud.txt"\n'
+    '    out:\n      summary: "work/episode/{episode}/summary.txt"\n'
+    '    run: "cat {parts} > {summary}"\n'
+)
+
+SPLIT_PY = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "infile, outdir = sys.argv[1], Path(sys.argv[2])\n"
+    "lines = [l for l in Path(infile).read_text().splitlines() if l.strip()]\n"
+    "for i, line in enumerate(lines):\n"
+    "    seg = outdir / f'{i:02d}'\n"
+    "    seg.mkdir(parents=True, exist_ok=True)\n"
+    "    (seg / 'line.txt').write_text(line + '\\n')\n"
+)
+
+
+def _demo_project(tmp_path: Path, ep1="a\nb\nc\n", ep2="d\ne\n") -> Project:
+    project = make_project(tmp_path, DEMO)
+    write(tmp_path, "scripts/split.py", SPLIT_PY)
+    write(tmp_path, "sources/episode/ep01/lines.txt", ep1)
+    write(tmp_path, "sources/episode/ep02/lines.txt", ep2)
+    return project
+
+
+def test_fixpoint_chain_converges(tmp_path: Path):
+    project = _demo_project(tmp_path)
+    executed = run(project)
+    # split x2, shout x5 (3+2 lines), summary x2
+    assert executed == 2 + 5 + 2
+    assert (tmp_path / "work/episode/ep01/segment/00/loud.txt").read_text() == "A\n"
+    assert (tmp_path / "work/episode/ep01/summary.txt").read_text() == "A\nB\nC\n"
+    assert (tmp_path / "work/episode/ep02/summary.txt").read_text() == "D\nE\n"
+
+
+def test_second_run_is_idempotent(tmp_path: Path):
+    project = _demo_project(tmp_path)
+    run(project)
+    assert run(project) == 0  # everything up to date
+
+
+def test_touching_one_input_reruns_only_that_branch(tmp_path: Path):
+    project = _demo_project(tmp_path)
+    run(project)
+    write(tmp_path, "sources/episode/ep02/lines.txt", "d\ne\nf\n")
+    executed = run(project)
+    # ep02: split(1) reruns; only the new segment's shout(1) is stale (00/01 content
+    # unchanged -> content-hash holds); summary(1) reruns as its list grew. ep01 holds.
+    assert executed == 3
+    assert (tmp_path / "work/episode/ep02/summary.txt").read_text() == "D\nE\nF\n"
+
+
+def test_prune_removes_vanished_segment(tmp_path: Path):
+    project = _demo_project(tmp_path)
+    run(project)
+    assert (tmp_path / "work/episode/ep01/segment/02/line.txt").exists()
+    write(tmp_path, "sources/episode/ep01/lines.txt", "a\nb\n")
+    run(project)
+    assert not (tmp_path / "work/episode/ep01/segment/02").exists()
+    assert (tmp_path / "work/episode/ep01/segment/01/line.txt").exists()
+    assert (tmp_path / "work/episode/ep02/segment/01/line.txt").exists()
+    assert (tmp_path / "work/episode/ep01/summary.txt").read_text() == "A\nB\n"
+
+
+def test_force_rebuilds_everything(tmp_path: Path):
+    project = _demo_project(tmp_path)
+    run(project)
+    loaded = load_pipeline(project, "g")
+    assert enginelib.run(project, loaded, force=True) > 0
+
+
+def test_max_iterations_breaker(tmp_path: Path):
+    # A rule whose output feeds its own input never converges: each pass discovers a new
+    # path produced by the previous one. The circuit breaker must fire.
+    project = make_project(
+        tmp_path,
+        "name: g\n"
+        "rules:\n"
+        "  - name: grow\n"
+        '    in:\n      seed: "seed/{n}.txt"\n'
+        '    out:\n      next: "seed/{n}x.txt"\n'
+        '    run: "cp {seed} {next}"\n',
+    )
+    (tmp_path / "smoketree.yaml").write_text("name: p\ndefaults:\n  max_iterations: 5\n")
+    write(tmp_path, "seed/a.txt")
+    project = Project(tmp_path)
+    with pytest.raises(ExecutionError):
+        run(project)
+
+
+# --------------------------------------------------------------------------- #
+# feedback.append: seeded feedback channel attached to an output rule
+# --------------------------------------------------------------------------- #
+
+
+FEEDBACK_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: fb\n"
+    '    in:\n      notes: "feedback/{m}/notes.md"\n'
+    '    out:\n      directive: "work/{m}/directive.txt"\n'
+    '    run: "cp {notes} {directive}"\n'
+    "  - name: make\n"
+    '    in:\n      brief: "sources/{m}/brief.txt"\n'
+    '      directive: "work/{m}/directive.txt"\n'
+    '    out:\n      art: "work/{m}/art.txt"\n'
+    '    run: "cat {brief} {directive} > {art}"\n'
+    "    feedback:\n"
+    '      append: "feedback/{m}/notes.md"\n'
+)
+
+
+def _feedback_project(tmp_path: Path) -> Project:
+    project = make_project(tmp_path, FEEDBACK_PIPE)
+    write(tmp_path, "sources/a/brief.txt", "A\n")
+    write(tmp_path, "sources/b/brief.txt", "B\n")
+    return project
+
+
+def test_feedback_seeds_and_bootstraps_loop(tmp_path: Path):
+    project = _feedback_project(tmp_path)
+    executed = run(project)
+    # seed a,b -> fb a,b -> make a,b
+    assert executed == 4
+    for m in ("a", "b"):
+        assert (tmp_path / f"feedback/{m}/notes.md").read_text() == "(no feedback yet)\n"
+    assert (tmp_path / "work/a/art.txt").read_text() == "A\n(no feedback yet)\n"
+    assert run(project) == 0  # idempotent
+
+
+def test_feedback_edit_reruns_only_that_branch(tmp_path: Path):
+    project = _feedback_project(tmp_path)
+    run(project)
+    write(tmp_path, "feedback/a/notes.md", "make it red\n")
+    executed = run(project)
+    assert executed == 2  # fb(a) + make(a); b holds
+    assert (tmp_path / "work/a/art.txt").read_text() == "A\nmake it red\n"
+    # the edited note is never clobbered by re-seeding
+    assert (tmp_path / "feedback/a/notes.md").read_text() == "make it red\n"
+
+
+def test_feedback_does_not_clobber_existing(tmp_path: Path):
+    project = _feedback_project(tmp_path)
+    write(tmp_path, "feedback/a/notes.md", "pre-existing\n")
+    run(project)
+    assert (tmp_path / "feedback/a/notes.md").read_text() == "pre-existing\n"
+    assert (tmp_path / "work/a/art.txt").read_text() == "A\npre-existing\n"
+
+
+def test_disabled_rule_never_runs(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: live\n"
+        '    in:\n      a: "src/{k}.txt"\n'
+        '    out:\n      b: "work/live/{k}.txt"\n    run: "cp {a} {b}"\n'
+        "  - name: dead\n    enabled: false\n"
+        '    in:\n      a: "src/{k}.txt"\n'
+        '    out:\n      b: "work/dead/{k}.txt"\n    run: "cp {a} {b}"\n',
+    )
+    write(tmp_path, "src/x.txt", "x\n")
+    assert run(project) == 1  # only the enabled rule
+    assert (tmp_path / "work/live/x.txt").exists()
+    assert not (tmp_path / "work/dead").exists()
+
+
+def test_feedback_unknown_key_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n  - name: r\n"
+        '    in:\n      a: "src/{m}.txt"\n'
+        '    out:\n      b: "out/{m}.txt"\n    run: "cp {a} {b}"\n'
+        "    feedback:\n"
+        '      append: "feedback/{other}/notes.md"\n',
+    )
+    with pytest.raises(SmoketreeError):
+        load_pipeline(project, "g")
+
+
+# --------------------------------------------------------------------------- #
+# Workspace index (the human-in-the-loop feedback surface)
+# --------------------------------------------------------------------------- #
+
+
+WORKSPACE_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: render\n"
+    '    in:\n      prompt: "work/{m}/p.txt"\n'
+    '    out:\n      image: "work/{m}/out.png"\n'
+    '    run: "cp {prompt} {image}"\n'
+    "    feedback:\n"
+    '      append: "feedback/{m}/notes.md"\n'
+)
+
+
+def test_workspace_index_pairs_output_with_channel(tmp_path: Path):
+    from smoketree.workspace.index import add_note, build_index
+
+    project = make_project(tmp_path, WORKSPACE_PIPE)
+    # simulate a completed render (the index reads outputs off disk, no run)
+    write(tmp_path, "work/a/out.png", "img-a")
+    write(tmp_path, "work/b/out.png", "img-b")
+
+    cards = build_index(project, "g")
+    by_label = {c.label: c for c in cards}
+    assert set(by_label) == {"a", "b"}
+    card = by_label["a"]
+    assert card.rule == "render"
+    assert card.media == "image"
+    assert card.output_path == tmp_path / "work/a/out.png"
+    assert card.note_path == tmp_path / "feedback/a/notes.md"
+    assert card.has_note is False
+
+    # first note replaces the (absent/placeholder) channel content
+    assert add_note(card, "make it brighter") is True
+    assert (tmp_path / "feedback/a/notes.md").read_text() == "make it brighter\n"
+
+    # a second note APPENDS (the channel is an accumulating log)
+    assert add_note(card, "and bigger") is True
+    assert (tmp_path / "feedback/a/notes.md").read_text() == "make it brighter\nand bigger\n"
+
+    # an empty submission is a no-op (never empties a pipeline-input channel)
+    add_note(card, "   ")
+    assert (tmp_path / "feedback/a/notes.md").read_text() == "make it brighter\nand bigger\n"
+
+
+def test_workspace_replaces_seed_placeholder(tmp_path: Path):
+    from smoketree.workspace.index import add_note, build_index
+
+    project = make_project(tmp_path, WORKSPACE_PIPE)
+    write(tmp_path, "work/a/out.png", "img-a")
+    write(tmp_path, "feedback/a/notes.md", "(no feedback yet)\n")  # seeded, untouched
+
+    card = build_index(project, "g")[0]
+    assert card.has_note is False  # placeholder doesn't count as a note
+    add_note(card, "first real note")
+    assert (tmp_path / "feedback/a/notes.md").read_text() == "first real note\n"
+
+
+def test_workspace_index_empty_before_render(tmp_path: Path):
+    from smoketree.workspace.index import build_index
+
+    project = make_project(tmp_path, WORKSPACE_PIPE)
+    assert build_index(project, "g") == []  # no outputs on disk yet
+
+
+# --------------------------------------------------------------------------- #
+# Loader + scaffold (carried over)
+# --------------------------------------------------------------------------- #
 
 
 def test_env_substitution(monkeypatch):
     monkeypatch.setenv("FOO", "bar")
     assert substitute_env({"k": "${FOO}/x"}) == {"k": "bar/x"}
-    assert substitute_env(["${FOO}", 1]) == ["bar", 1]
 
 
-def test_env_substitution_missing(monkeypatch):
-    monkeypatch.delenv("NOPE", raising=False)
-    with pytest.raises(SmoketreeError):
-        substitute_env("${NOPE}")
-
-
-# --------------------------------------------------------------------------- #
-# Graph parsing / validation
-# --------------------------------------------------------------------------- #
-
-
-def test_demo_topological_order(project: Project):
-    graph = load_graph(project, "demo")
-    assert graph.execution_order == ["text", "shout", "reverse", "stats"]
-
-
-def test_portrait_topological_order(tmp_path: Path):
-    init_project(tmp_path, "p", template="portrait")
-    graph = load_graph(Project(tmp_path), "portrait")
-    assert graph.execution_order == [
-        "source",
-        "description",
-        "prompt",
-        "generated",
-        "upscaled",
-    ]
-
-
-def test_cycle_detection(project: Project):
-    (project.graphs_dir / "cyc.yaml").write_text(
-        "name: cyc\n"
-        "nodes:\n"
-        "  a: {type: transform, transformer: shout, inputs: {input: b}}\n"
-        "  b: {type: transform, transformer: shout, inputs: {input: a}}\n"
-    )
-    with pytest.raises(ValidationError, match="cycle"):
-        load_graph(project, "cyc")
-
-
-def test_media_type_mismatch(project: Project):
-    (project.transformers_dir / "needs_image.yaml").write_text(
-        "name: needs_image\n"
-        "type: shell\n"
-        "command: cp {inputs.image} {outputs.x}\n"
-        "inputs:\n  image: {type: file, media: image}\n"
-        "outputs:\n  x: {type: file, media: data}\n"
-    )
-    (project.graphs_dir / "mm.yaml").write_text(
-        "name: mm\n"
-        "nodes:\n"
-        "  t: {type: source, path: sources/hello.txt}\n"  # text feeding an image input
-        "  b: {type: transform, transformer: needs_image, inputs: {image: t}}\n"
-    )
-    with pytest.raises(ValidationError, match="Media type mismatch"):
-        load_graph(project, "mm")
-
-
-def test_unknown_input_rejected(project: Project):
-    (project.graphs_dir / "ui.yaml").write_text(
-        "name: ui\n"
-        "nodes:\n"
-        "  t: {type: source, path: sources/hello.txt}\n"
-        "  s: {type: transform, transformer: shout, inputs: {input: t, bogus: t}}\n"
-    )
-    with pytest.raises(ValidationError, match="unknown inputs"):
-        load_graph(project, "ui")
-
-
-def test_subgraph_order(project: Project):
-    graph = load_graph(project, "demo")
-    assert graph.subgraph_order("reverse") == ["text", "shout", "reverse"]
+def test_demo_template_runs_end_to_end(tmp_path: Path):
+    init_project(tmp_path, "proj", template="demo")
+    project = Project(tmp_path)
+    loaded = load_pipeline(project, "demo")
+    assert enginelib.run(project, loaded) > 0
+    report = (tmp_path / "report.txt").read_text()
+    assert "THE SMOKETREE DIFFUSES LIKE PIXELS" in report
 
 
 # --------------------------------------------------------------------------- #
-# Cache / seed
+# Backends: ollama + replicate (mocked — no network)
 # --------------------------------------------------------------------------- #
 
 
-def test_seed_deterministic():
-    a = cachelib.compute_seed("g", "n", 0)
-    b = cachelib.compute_seed("g", "n", 0)
-    c = cachelib.compute_seed("g", "n", 1)
-    assert a == b
-    assert a != c
-    assert 0 <= a < 2**32
+def _png(path: Path) -> Path:
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(path)
+    return path
 
 
-def test_cache_key_changes_with_input():
-    base = cachelib.compute_cache_key({"x": "h1"}, "tf", None, 0)
-    changed_input = cachelib.compute_cache_key({"x": "h2"}, "tf", None, 0)
-    changed_tf = cachelib.compute_cache_key({"x": "h1"}, "tf2", None, 0)
-    changed_take = cachelib.compute_cache_key({"x": "h1"}, "tf", None, 1)
-    assert len({base, changed_input, changed_tf, changed_take}) == 4
+def test_ollama_backend_runs_via_engine(tmp_path: Path, monkeypatch):
+    posted = {}
 
-
-def test_cache_key_stable_across_input_order():
-    a = cachelib.compute_cache_key({"x": "1", "y": "2"}, "tf", None, 0)
-    b = cachelib.compute_cache_key({"y": "2", "x": "1"}, "tf", None, 0)
-    assert a == b
-
-
-# --------------------------------------------------------------------------- #
-# Claude backend (prompt assembly, no network)
-# --------------------------------------------------------------------------- #
-
-
-class _StubProject:
-    """Minimal stand-in for prompt/payload-assembly unit tests (resizing disabled)."""
-
-    class config:
-        class defaults:
-            image_max_edge = 0  # don't re-encode the tests' dummy image bytes
-
-
-def _ctx(tmp_path, transformer, inputs) -> ExecutionContext:
-    return ExecutionContext(
-        project=_StubProject(),  # type: ignore[arg-type]
-        graph_id="g",
-        node_id="n",
-        transformer=transformer,
-        inputs=inputs,
-        output_targets={"out": tmp_path / "out.txt"},
-        scratch_dir=tmp_path,
-        output_dir=tmp_path,
-        seed=1,
-        take=0,
-    )
-
-
-def test_claude_inlines_text(tmp_path):
-    text_file = tmp_path / "in.txt"
-    text_file.write_text("HELLO")
-    tf = ClaudeTransformer(
-        name="x",
-        type="claude",
-        prompt="Say: {inputs.text}",
-        inputs={"text": InputSpec(media="text")},
-        outputs={"out": OutputSpec(media="text", format="txt")},
-    )
-    art = Artifact(path=text_file, media="text", format="txt", content_hash="h")
-    prompt, images = ClaudeBackend()._build_prompt(_ctx(tmp_path, tf, {"text": art}))
-    assert prompt == "Say: HELLO"
-    assert images == []
-
-
-def test_claude_attaches_image(tmp_path):
-    img = tmp_path / "in.png"
-    img.write_bytes(b"\x89PNG\r\n")
-    tf = ClaudeTransformer(
-        name="x",
-        type="claude",
-        prompt="Describe: {inputs.image}",
-        inputs={"image": InputSpec(media="image")},
-        outputs={"out": OutputSpec(media="text", format="txt")},
-    )
-    art = Artifact(path=img, media="image", format="png", content_hash="h")
-    prompt, images = ClaudeBackend()._build_prompt(_ctx(tmp_path, tf, {"image": art}))
-    assert "Describe:" in prompt
-    assert len(images) == 1
-    assert images[0]["type"] == "image"
-    assert images[0]["source"]["media_type"] == "image/png"
-
-
-# --------------------------------------------------------------------------- #
-# Ollama backend (payload assembly, no network)
-# --------------------------------------------------------------------------- #
-
-
-def _ollama_tf(prompt, inputs, **kw) -> OllamaTransformer:
-    return OllamaTransformer(
-        name="x",
-        type="ollama",
-        model=kw.pop("model", "llama3.2"),
-        prompt=prompt,
-        inputs=inputs,
-        outputs={"out": OutputSpec(media="text", format="txt")},
-        **kw,
-    )
-
-
-def test_ollama_payload_text(tmp_path):
-    text_file = tmp_path / "in.txt"
-    text_file.write_text("a sunset")
-    tf = _ollama_tf("Rewrite: {inputs.text}", {"text": InputSpec(media="text")},
-                    system="be concise")
-    art = Artifact(path=text_file, media="text", format="txt", content_hash="h")
-    payload = OllamaBackend()._build_payload(_ctx(tmp_path, tf, {"text": art}))
-    assert payload["prompt"] == "Rewrite: a sunset"
-    assert payload["model"] == "llama3.2"
-    assert payload["system"] == "be concise"
-    assert payload["stream"] is False
-    assert payload["options"]["seed"] == 1  # injected from ctx.seed
-    assert "images" not in payload
-
-
-def test_ollama_payload_image(tmp_path):
-    img = tmp_path / "in.png"
-    img.write_bytes(b"\x89PNG\r\n")
-    tf = _ollama_tf("Describe: {inputs.image}", {"image": InputSpec(media="image")},
-                    model="llava")
-    art = Artifact(path=img, media="image", format="png", content_hash="h")
-    payload = OllamaBackend()._build_payload(_ctx(tmp_path, tf, {"image": art}))
-    assert payload["model"] == "llava"
-    assert len(payload["images"]) == 1
-    assert isinstance(payload["images"][0], str)  # base64
-
-
-def test_ollama_empty_response_fails(tmp_path, monkeypatch):
-    text_file = tmp_path / "in.txt"
-    text_file.write_text("x")
-    tf = _ollama_tf("{inputs.text}", {"text": InputSpec(media="text")})
-    art = Artifact(path=text_file, media="text", format="txt", content_hash="h")
-
-    class _Proj:
-        class config:
-            class defaults:
-                ollama_url = "http://localhost:11434"
-
-    ctx = ExecutionContext(
-        project=_Proj(),  # type: ignore[arg-type]
-        graph_id="g", node_id="n", transformer=tf, inputs={"text": art},
-        output_targets={"out": tmp_path / "out.txt"},
-        scratch_dir=tmp_path, output_dir=tmp_path, seed=1, take=0,
-    )
-
-    class _EmptyResp:
+    class FakeResp:
         def raise_for_status(self):
             pass
 
         def json(self):
-            return {"response": "   \n", "done_reason": "stop", "eval_count": 60}
+            return {"response": "GEN:" + posted["prompt"]}
 
-    class _EmptyClient:
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
         def __enter__(self):
             return self
 
         def __exit__(self, *a):
             return False
 
-        def post(self, url, json=None):
-            return _EmptyResp()
+        def post(self, url, json):
+            posted.update(json)
+            return FakeResp()
 
-    monkeypatch.setattr("smoketree.backends.ollama.httpx.Client",
-                        lambda *a, **k: _EmptyClient())
-    with pytest.raises(SmoketreeError, match="empty response"):
-        OllamaBackend().execute(ctx)
-    assert not (tmp_path / "out.txt").exists()  # no output written on failure
+    monkeypatch.setattr("smoketree.backends.ollama.httpx.Client", FakeClient)
 
-
-def test_ollama_think_param(tmp_path):
-    text_file = tmp_path / "in.txt"
-    text_file.write_text("x")
-    art = Artifact(path=text_file, media="text", format="txt", content_hash="h")
-
-    # omitted by default
-    tf = _ollama_tf("{inputs.text}", {"text": InputSpec(media="text")})
-    payload = OllamaBackend()._build_payload(_ctx(tmp_path, tf, {"text": art}))
-    assert "think" not in payload
-
-    # passed through when set
-    tf = _ollama_tf("{inputs.text}", {"text": InputSpec(media="text")}, think=False)
-    payload = OllamaBackend()._build_payload(_ctx(tmp_path, tf, {"text": art}))
-    assert payload["think"] is False
-
-
-def test_ollama_explicit_seed_preserved(tmp_path):
-    text_file = tmp_path / "in.txt"
-    text_file.write_text("x")
-    tf = _ollama_tf("{inputs.text}", {"text": InputSpec(media="text")},
-                    options={"seed": 999, "temperature": 0.5})
-    art = Artifact(path=text_file, media="text", format="txt", content_hash="h")
-    payload = OllamaBackend()._build_payload(_ctx(tmp_path, tf, {"text": art}))
-    assert payload["options"]["seed"] == 999
-    assert payload["options"]["temperature"] == 0.5
-
-
-# --------------------------------------------------------------------------- #
-# ComfyUI backend (injection + collection, faked client)
-# --------------------------------------------------------------------------- #
-
-
-class _FakeResponse:
-    def __init__(self, content=b"", json_data=None):
-        self.content = content
-        self._json = json_data
-
-    def raise_for_status(self):
-        pass
-
-    def json(self):
-        return self._json
-
-
-class _FakeClient:
-    def __init__(self):
-        self.downloaded = []
-
-    def get(self, url, params=None):
-        self.downloaded.append(params)
-        return _FakeResponse(content=b"IMAGEBYTES")
-
-
-def test_comfyui_inject_text(tmp_path):
-    prompt_file = tmp_path / "p.txt"
-    prompt_file.write_text("a cat")
-    tf = ComfyUITransformer(
-        name="x",
-        type="comfyui",
-        workflow="w.json",
-        inputs={
-            "prompt": InputSpec(media="text", inject=ComfyInject(node_id="6", field="text"))
-        },
-        outputs={
-            "image": OutputSpec(
-                media="image", format="png",
-                collect=ComfyCollect(node_id="9", field="filename_prefix"),
-            )
-        },
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: prompt\n    backend: ollama\n"
+        '    in:\n      brief: "sources/{m}/brief.txt"\n'
+        '    out:\n      prompt: "work/{m}/prompt.txt"\n'
+        "    config:\n      model: testmodel\n      options: {num_predict: 16}\n"
+        '      prompt: "BRIEF={brief} KEY={m}"\n',
     )
-    art = Artifact(path=prompt_file, media="text", format="txt", content_hash="h")
-    ctx = _ctx(tmp_path, tf, {"prompt": art})
-    workflow = {"6": {"class_type": "CLIPTextEncode", "inputs": {"text": "old"}}}
-    ComfyUIBackend()._inject_inputs(_FakeClient(), workflow, ctx)
-    assert workflow["6"]["inputs"]["text"] == "a cat"
+    write(tmp_path, "sources/alpha/brief.txt", "a winged thing\n")
+    run(project)
+
+    out = (tmp_path / "work/alpha/prompt.txt").read_text()
+    assert out.startswith("GEN:")
+    assert "a winged thing" in posted["prompt"] and "KEY=alpha" in posted["prompt"]
+    assert "seed" in posted["options"]  # deterministic seed injected
 
 
-def test_comfyui_upload_is_content_addressed(tmp_path):
-    from smoketree.backends.comfyui import ComfyUIBackend
+def test_replicate_build_input_maps_fields(tmp_path: Path):
+    from smoketree.backends.base import ExecutionContext
+    from smoketree.backends.replicate import ReplicateBackend
 
-    class _CapClient:
-        def post(self, url, files=None, data=None):
-            name = files["image"][0]
-
-            class _R:
-                status_code = 200
-
-                def json(self):
-                    return {"name": name}
-
-            return _R()
-
-    a = tmp_path / "a.png"; a.write_bytes(b"AAA")
-    b = tmp_path / "b.png"; b.write_bytes(b"BBB")
-    be, c = ComfyUIBackend(), _CapClient()
-    n1, n2, n3 = be._upload_image(c, a), be._upload_image(c, b), be._upload_image(c, a)
-    assert n1 != n2          # distinct content -> distinct upload name
-    assert n1 == n3          # identical content -> same name (dedupe)
-    assert n1.startswith("smoketree_")
-
-
-def test_comfyui_strips_annotation_keys():
-    from smoketree.backends.comfyui import _node_dict
-
-    wf = {"_comment": "docs", "6": {"class_type": "X", "inputs": {}}}
-    stripped = _node_dict(wf)
-    assert "_comment" not in stripped
-    assert stripped == {"6": {"class_type": "X", "inputs": {}}}
-
-
-def test_comfyui_seed_injection(tmp_path):
-    tf = ComfyUITransformer(
-        name="x",
-        type="comfyui",
-        workflow="w.json",
-        seed_inject=ComfyInject(node_id="3", field="seed"),
-        inputs={},
-        outputs={
-            "image": OutputSpec(
-                media="image", format="png",
-                collect=ComfyCollect(node_id="9", field="filename_prefix"),
-            )
-        },
-    )
-    ctx = _ctx(tmp_path, tf, {})  # _ctx sets seed=1
-    workflow = {"3": {"class_type": "KSampler", "inputs": {"seed": 0}}}
-    ComfyUIBackend()._inject_inputs(_FakeClient(), workflow, ctx)
-    assert workflow["3"]["inputs"]["seed"] == ctx.seed == 1
-
-
-def test_comfyui_seed_injection_unknown_node(tmp_path):
-    tf = ComfyUITransformer(
-        name="x", type="comfyui", workflow="w.json",
-        seed_inject=ComfyInject(node_id="99", field="seed"),
-        inputs={},
-        outputs={"image": OutputSpec(media="image", format="png",
-            collect=ComfyCollect(node_id="9", field="filename_prefix"))},
-    )
-    ctx = _ctx(tmp_path, tf, {})
-    with pytest.raises(SmoketreeError, match="seed_inject"):
-        ComfyUIBackend()._inject_inputs(_FakeClient(), {"3": {"inputs": {}}}, ctx)
-
-
-def test_comfyui_collect_outputs(tmp_path):
-    tf = ComfyUITransformer(
-        name="x",
-        type="comfyui",
-        workflow="w.json",
-        inputs={},
-        outputs={
-            "image": OutputSpec(
-                media="image", format="png",
-                collect=ComfyCollect(node_id="9", field="filename_prefix"),
-            )
-        },
-    )
+    init_project(tmp_path, "p", template="minimal")
+    txt = write(tmp_path, "p.txt", "make a portrait")
+    img = _png(tmp_path / "ref.png")
     ctx = ExecutionContext(
-        project=None,  # type: ignore[arg-type]
-        graph_id="g", node_id="n", transformer=tf, inputs={},
-        output_targets={"image": tmp_path / "image.png"},
-        scratch_dir=tmp_path, output_dir=tmp_path, seed=1, take=0,
+        project=Project(tmp_path),
+        rule_name="r",
+        keys={"m": "alpha"},
+        inputs={"prompt": txt, "image": [img]},
+        outputs={"image": tmp_path / "out.png"},
+        config={
+            "model": "owner/name",
+            "seed_field": "seed",
+            "params": {"aspect_ratio": "2:3"},
+            "fields": {"image": {"field": "input_images", "array": True}},
+        },
+        seed=42,
     )
-    history = {
-        "outputs": {
-            "9": {"images": [{"filename": "out_001.png", "subfolder": "", "type": "output"}]}
-        }
-    }
-    produced = ComfyUIBackend()._collect_outputs(_FakeClient(), history, ctx)
-    assert produced["image"].read_bytes() == b"IMAGEBYTES"
-    assert produced["image"].suffix == ".png"
+    inp = ReplicateBackend()._build_input(ctx)
+    assert inp["aspect_ratio"] == "2:3"
+    assert inp["prompt"] == "make a portrait"
+    assert isinstance(inp["input_images"], list)
+    assert inp["input_images"][0].startswith("data:image/png;base64,")
+    assert inp["seed"] == 42
 
 
-# --------------------------------------------------------------------------- #
-# End-to-end shell pipeline + caching
-# --------------------------------------------------------------------------- #
+def test_replicate_accumulates_array_field(tmp_path: Path):
+    """Two distinct image inputs targeting one array field concat in declaration order."""
+    from smoketree.backends.base import ExecutionContext
+    from smoketree.backends.replicate import ReplicateBackend
 
-
-def test_end_to_end_run_and_cache(project: Project, capsys):
-    from smoketree.executor import compute_plan, run
-
-    graph = load_graph(project, "demo")
-    run(project, graph, take=0)
-
-    # All outputs produced.
-    stats = cachelib.cache_node_dir(project, "demo", "stats", 0) / "text.txt"
-    assert stats.exists()
-
-    # Second plan: everything cached.
-    entries = {e.node_id: e.action for e in compute_plan(project, graph, take=0)}
-    assert entries == {
-        "text": "SKIP", "shout": "SKIP", "reverse": "SKIP", "stats": "SKIP",
-    }
-
-    # Modify source -> downstream invalidated.
-    (project.sources_dir / "hello.txt").write_text("changed!\n")
-    entries = {e.node_id: e.action for e in compute_plan(project, graph, take=0)}
-    assert entries["shout"] == "RUN"
-    assert entries["reverse"] == "RUN"
-
-
-def test_output_symlink_created(project: Project):
-    from smoketree.executor import run
-
-    graph = load_graph(project, "demo")
-    run(project, graph, take=0)
-    link = project.outputs_dir / "demo__stats.txt"
-    assert link.exists()
-
-
-def test_outputs_written_incrementally(project: Project):
-    """An exported node's output is linked as soon as it's produced — before a later
-    node (here, a failing one) runs."""
-    from smoketree.executor import run
-
-    (project.transformers_dir / "boom.yaml").write_text(
-        "name: boom\ntype: shell\ncommand: 'false'\n"
-        "inputs:\n  input: {type: file, media: text}\n"
-        "outputs:\n  text: {type: file, media: text, format: txt}\n"
+    init_project(tmp_path, "p", template="minimal")
+    a = _png(tmp_path / "model.png")
+    b = _png(tmp_path / "outfit.png")
+    ctx = ExecutionContext(
+        project=Project(tmp_path),
+        rule_name="dressed",
+        keys={},
+        inputs={"model_ref": a, "outfit_ref": b},  # declaration order: model, then outfit
+        outputs={"image": tmp_path / "out.png"},
+        config={
+            "model": "owner/flux-2",
+            "fields": {
+                "model_ref": {"field": "input_images", "array": True},
+                "outfit_ref": {"field": "input_images", "array": True},
+            },
+        },
     )
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  t: {type: source, path: sources/hello.txt}\n"
-        "  a: {type: transform, transformer: shout, output: true, inputs: {input: t}}\n"
-        "  b: {type: transform, transformer: boom, inputs: {input: a}}\n"
+    inp = ReplicateBackend()._build_input(ctx)
+    assert len(inp["input_images"]) == 2  # both refs present, not overwritten
+    assert all(v.startswith("data:image/png;base64,") for v in inp["input_images"])
+
+
+def test_replicate_backend_runs_via_engine(tmp_path: Path, monkeypatch):
+    import sys
+    import types
+
+    fake = types.ModuleType("replicate")
+
+    class FakeClient:
+        def __init__(self, api_token=None):
+            pass
+
+        def run(self, model, input):
+            assert input["prompt"] == "hello prompt"
+            return b"IMGBYTES"
+
+    fake.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: render\n    backend: replicate\n"
+        '    in:\n      prompt: "work/{m}/prompt.txt"\n'
+        '    out:\n      image: "work/{m}/portrait.png"\n'
+        "    config:\n      model: owner/flux\n      seed_field: seed\n",
     )
-    graph = load_graph(project, "g")
-    with pytest.raises(SmoketreeError):
-        run(project, graph, take=0)
-    # `a` was exported before `b` failed
-    assert (project.outputs_dir / "g__a.txt").exists()
-
-
-def test_stale_output_links_pruned(project: Project):
-    from smoketree.executor import run
-
-    graph = load_graph(project, "demo")
-    run(project, graph, take=0)
-    real = project.outputs_dir / "demo__stats.txt"
-    assert real.exists()
-    # simulate a stale link from an earlier instance of the same node
-    stale = project.outputs_dir / "demo__stats__deadbeef0000.txt"
-    stale.symlink_to(real.resolve())
-    assert stale.exists()
-    run(project, graph, take=0, force=True)
-    assert not stale.exists()        # stale per-node link pruned
-    assert real.exists()             # current link kept
-
-
-def test_output_flag_exports_non_terminal_node(project: Project):
-    from smoketree.executor import run
-
-    # mark `shout` (a non-terminal node, consumed by reverse) as output: true
-    g = (project.graphs_dir / "demo.yaml").read_text().replace(
-        "    transformer: shout\n    inputs:\n      input: text\n",
-        "    transformer: shout\n    output: true\n    inputs:\n      input: text\n",
-    )
-    (project.graphs_dir / "demo.yaml").write_text(g)
-    run(project, load_graph(project, "demo"), take=0)
-    assert (project.outputs_dir / "demo__shout.txt").exists()   # forced export
-    assert (project.outputs_dir / "demo__stats.txt").exists()   # terminal still exported
-
-
-def test_take_changes_seed_and_dir(project: Project):
-    from smoketree.executor import run
-
-    graph = load_graph(project, "demo")
-    run(project, graph, take=0)
-    run(project, graph, take=2)
-    assert cachelib.cache_node_dir(project, "demo", "shout", 2).exists()
-    assert (cachelib.cache_node_dir(project, "demo", "shout", 0)
-            != cachelib.cache_node_dir(project, "demo", "shout", 2))
-
-
-# --------------------------------------------------------------------------- #
-# Collections and fan-out
-# --------------------------------------------------------------------------- #
-
-
-def _write(path: Path, content: str = "") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-
-
-_PAIR_TRANSFORMER = (
-    "name: pair\n"
-    "type: shell\n"
-    "command: cat {inputs.a} {inputs.b} > {outputs.text}\n"
-    "inputs:\n"
-    "  a: {type: file, media: text}\n"
-    "  b: {type: file, media: text}\n"
-    "outputs:\n"
-    "  text: {type: file, media: text, format: txt}\n"
-)
-
-
-@pytest.fixture
-def collections_project(project: Project) -> Project:
-    for n in ("1", "2"):
-        _write(project.sources_dir / "a" / f"{n}.txt", f"a{n}\n")
-    for n in ("x", "y", "z"):
-        _write(project.sources_dir / "b" / f"{n}.txt", f"b{n}\n")
-    (project.transformers_dir / "pair.yaml").write_text(_PAIR_TRANSFORMER)
-    return project
-
-
-def test_collection_is_flagged_and_propagates(project: Project):
-    _write(project.sources_dir / "a" / "1.txt", "a1\n")
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  items: {type: collection, glob: sources/a/*.txt}\n"
-        "  up: {type: transform, transformer: shout, inputs: {input: items}, "
-        "expand: each}\n"
-    )
-    graph = load_graph(project, "g")
-    assert graph.is_collection("items") is True
-    assert graph.is_collection("up") is True  # consumes a collection
-
-
-def test_each_fanout_runs_per_item(project: Project):
-    from smoketree.executor import run
-    from smoketree.cache import State
-
-    for n in ("1", "2", "3"):
-        _write(project.sources_dir / "a" / f"{n}.txt", f"a{n}\n")
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  items: {type: collection, glob: sources/a/*.txt}\n"
-        "  up: {type: transform, transformer: shout, inputs: {input: items}, "
-        "expand: each}\n"
-    )
-    graph = load_graph(project, "g")
-    run(project, graph, take=0)
-    state = State.load(project, "g")
-    assert len(state.nodes["up"]) == 3  # one instance per item
-
-
-def test_product_fanout(collections_project: Project):
-    from smoketree.executor import run
-    from smoketree.cache import State
-
-    p = collections_project
-    (p.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  ca: {type: collection, glob: sources/a/*.txt}\n"
-        "  cb: {type: collection, glob: sources/b/*.txt}\n"
-        "  paired: {type: transform, transformer: pair, "
-        "inputs: {a: ca, b: cb}, expand: product}\n"
-    )
-    graph = load_graph(p, "g")
-    run(p, graph, take=0)
-    state = State.load(p, "g")
-    assert len(state.nodes["paired"]) == 6  # 2 x 3
-
-
-def test_zip_fanout_and_mismatch(collections_project: Project):
-    from smoketree.executor import run
-    from smoketree.cache import State
-
-    p = collections_project
-    # zip with equal lengths: a (2) zipped with a copy of a (2)
-    for n in ("1", "2"):
-        _write(p.sources_dir / "c" / f"{n}.txt", f"c{n}\n")
-    (p.graphs_dir / "ok.yaml").write_text(
-        "name: ok\n"
-        "nodes:\n"
-        "  ca: {type: collection, glob: sources/a/*.txt}\n"
-        "  cc: {type: collection, glob: sources/c/*.txt}\n"
-        "  z: {type: transform, transformer: pair, inputs: {a: ca, b: cc}, expand: zip}\n"
-    )
-    run(p, load_graph(p, "ok"), take=0)
-    assert len(State.load(p, "ok").nodes["z"]) == 2
-
-    # zip with unequal lengths -> runtime error
-    (p.graphs_dir / "bad.yaml").write_text(
-        "name: bad\n"
-        "nodes:\n"
-        "  ca: {type: collection, glob: sources/a/*.txt}\n"
-        "  cb: {type: collection, glob: sources/b/*.txt}\n"
-        "  z: {type: transform, transformer: pair, inputs: {a: ca, b: cb}, expand: zip}\n"
-    )
-    with pytest.raises(SmoketreeError, match="equal-length"):
-        run(p, load_graph(p, "bad"), take=0)
-
-
-def test_expand_required_when_collection_input(project: Project):
-    _write(project.sources_dir / "a" / "1.txt", "a1\n")
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  items: {type: collection, glob: sources/a/*.txt}\n"
-        "  up: {type: transform, transformer: shout, inputs: {input: items}}\n"
-    )
-    with pytest.raises(ValidationError, match="does not declare 'expand'"):
-        load_graph(project, "g")
-
-
-def test_expand_forbidden_without_collection(project: Project):
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  t: {type: source, path: sources/hello.txt}\n"
-        "  up: {type: transform, transformer: shout, inputs: {input: t}, expand: each}\n"
-    )
-    with pytest.raises(ValidationError, match="no collection inputs"):
-        load_graph(project, "g")
-
-
-def test_each_rejects_multiple_collections(collections_project: Project):
-    p = collections_project
-    (p.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  ca: {type: collection, glob: sources/a/*.txt}\n"
-        "  cb: {type: collection, glob: sources/b/*.txt}\n"
-        "  m: {type: transform, transformer: pair, inputs: {a: ca, b: cb}, expand: each}\n"
-    )
-    with pytest.raises(ValidationError, match="requires exactly one"):
-        load_graph(p, "g")
-
-
-def test_empty_glob_is_error(project: Project):
-    from smoketree.executor import run
-
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  items: {type: collection, glob: sources/none/*.txt}\n"
-        "  up: {type: transform, transformer: shout, inputs: {input: items}, "
-        "expand: each}\n"
-    )
-    with pytest.raises(SmoketreeError, match="matched no files"):
-        run(project, load_graph(project, "g"), take=0)
-
-
-def test_instance_hash_stable_and_distinct():
-    h1 = cachelib.instance_hash({"a": "/p/1.txt", "b": "/p/x.txt"})
-    h2 = cachelib.instance_hash({"b": "/p/x.txt", "a": "/p/1.txt"})  # order-independent
-    h3 = cachelib.instance_hash({"a": "/p/2.txt", "b": "/p/x.txt"})
-    assert h1 == h2
-    assert h1 != h3
-    assert len(h1) == 12
-
-
-# --------------------------------------------------------------------------- #
-# materialize (generate-once, then owned source of truth)
-# --------------------------------------------------------------------------- #
-
-
-# A "generator" shell transformer that stamps the seed into a file (so we can tell a
-# regeneration from a kept file), and a consumer that copies its input.
-_GEN_TRANSFORMER = (
-    "name: gen\ntype: shell\n"
-    "command: 'printf \"gen seed={seed}\\n\" > {outputs.doc}'\n"
-    "inputs: {}\n"
-    "outputs:\n  doc: {type: file, media: text, format: txt}\n"
-)
-_COPY_TRANSFORMER = (
-    "name: copydoc\ntype: shell\n"
-    "command: cp {inputs.src} {outputs.text}\n"
-    "inputs:\n  src: {type: file, media: text}\n"
-    "outputs:\n  text: {type: file, media: text, format: txt}\n"
-)
-
-
-@pytest.fixture
-def materialize_project(project: Project) -> Project:
-    (project.transformers_dir / "gen.yaml").write_text(_GEN_TRANSFORMER)
-    (project.transformers_dir / "copydoc.yaml").write_text(_COPY_TRANSFORMER)
-    (project.graphs_dir / "m.yaml").write_text(
-        "name: m\n"
-        "nodes:\n"
-        "  asset: {type: transform, transformer: gen, materialize: true, inputs: {}}\n"
-        "  derived: {type: transform, transformer: copydoc, inputs: {src: asset}}\n"
-    )
-    return project
-
-
-def _asset_file(project: Project):
-    import glob as _g
-    hits = _g.glob(str(project.scenes_dir / "m" / "asset" / "doc.*"))
-    return Path(hits[0]) if hits else None
-
-
-def test_materialize_validation_requires_single_output(project: Project):
-    (project.transformers_dir / "multi.yaml").write_text(
-        "name: multi\ntype: shell\ncommand: 'true'\n"
-        "inputs: {}\n"
-        "outputs:\n  a: {type: file, media: text}\n  b: {type: file, media: text}\n"
-    )
-    (project.graphs_dir / "bad.yaml").write_text(
-        "name: bad\nnodes:\n"
-        "  x: {type: transform, transformer: multi, materialize: true, inputs: {}}\n"
-    )
-    with pytest.raises(ValidationError, match="materialize requires exactly one"):
-        load_graph(project, "bad")
-
-
-def test_materialize_generates_once_into_scenes(materialize_project: Project):
-    from smoketree.executor import run
-
-    graph = load_graph(materialize_project, "m")
-    run(materialize_project, graph, take=0)
-    asset = _asset_file(materialize_project)
-    assert asset is not None and asset.exists()      # generated under scenes/
-    assert "scenes" in str(asset)
-    assert not str(asset).startswith(str(materialize_project.smoketree_dir))
-
-
-def test_materialize_kept_not_regenerated(materialize_project: Project):
-    from smoketree.executor import run
-
-    graph = load_graph(materialize_project, "m")
-    run(materialize_project, graph, take=0)
-    asset = _asset_file(materialize_project)
-    asset.write_text("HAND EDITED\n")           # artist owns it
-    run(materialize_project, graph, take=0)      # re-run
-    assert asset.read_text() == "HAND EDITED\n"  # not overwritten
-
-
-def test_materialize_edit_propagates_downstream(materialize_project: Project):
-    from smoketree.executor import run
-
-    graph = load_graph(materialize_project, "m")
-    run(materialize_project, graph, take=0)
-    asset = _asset_file(materialize_project)
-    asset.write_text("EDITED CONTENT\n")
-    run(materialize_project, graph, take=0)      # derived should rebuild from the edit
-    derived = (
-        cachelib.cache_node_dir(materialize_project, "m", "derived", 0) / "text.txt"
-    )
-    assert derived.read_text() == "EDITED CONTENT\n"
-
-
-def test_materialize_writes_instance_sidecar(project: Project):
-    """A fanned-out materialize node records which inputs each owned artifact came from."""
-    import json as _json
-
-    from smoketree.executor import run
-
-    for n in ("a", "b"):
-        _write(project.sources_dir / "refs" / f"{n}.txt", f"{n}\n")
-    (project.transformers_dir / "gen_from.yaml").write_text(
-        "name: gen_from\ntype: shell\n"
-        "command: cp {inputs.ref} {outputs.doc}\n"
-        "inputs:\n  ref: {type: file, media: text}\n"
-        "outputs:\n  doc: {type: file, media: text, format: txt}\n"
-    )
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  refs: {type: collection, glob: 'sources/refs/*.txt'}\n"
-        "  asset: {type: transform, transformer: gen_from, materialize: true, "
-        "expand: each, inputs: {ref: refs}}\n"
-    )
-    run(project, load_graph(project, "g"), take=0)
-    sidecars = list((project.scenes_dir / "g" / "asset").glob("*/.instance.json"))
-    assert len(sidecars) == 2
-    inputs = [_json.loads(s.read_text())["inputs"]["ref"] for s in sidecars]
-    assert sorted(inputs) == ["sources/refs/a.txt", "sources/refs/b.txt"]
-
-
-def test_materialize_force_regenerates(materialize_project: Project):
-    from smoketree.executor import run
-
-    graph = load_graph(materialize_project, "m")
-    run(materialize_project, graph, take=0)
-    asset = _asset_file(materialize_project)
-    asset.write_text("HAND EDITED\n")
-    run(materialize_project, graph, take=0, force=True)
-    assert asset.read_text() != "HAND EDITED\n"   # regenerated
-
-
-# --------------------------------------------------------------------------- #
-# Grouped collections + multi-file inputs
-# --------------------------------------------------------------------------- #
-
-
-_CATGROUP_TRANSFORMER = (
-    "name: catgroup\n"
-    "type: shell\n"
-    "command: cat {inputs.group} > {outputs.text}\n"
-    "inputs:\n  group: {type: file, media: text}\n"
-    "outputs:\n  text: {type: file, media: text, format: txt}\n"
-)
-
-_GROUPED_GRAPH = (
-    "name: g\n"
-    "nodes:\n"
-    "  items: {type: collection, glob: 'sources/g/*/*.txt', group_by: parent}\n"
-    "  combine: {type: transform, transformer: catgroup, "
-    "inputs: {group: items}, expand: each}\n"
-)
-
-
-@pytest.fixture
-def grouped_project(project: Project) -> Project:
-    _write(project.sources_dir / "g" / "alpha" / "1.txt", "a-one\n")
-    _write(project.sources_dir / "g" / "alpha" / "2.txt", "a-two\n")
-    _write(project.sources_dir / "g" / "beta" / "3.txt", "b-three\n")
-    (project.transformers_dir / "catgroup.yaml").write_text(_CATGROUP_TRANSFORMER)
-    (project.graphs_dir / "g.yaml").write_text(_GROUPED_GRAPH)
-    return project
-
-
-def test_group_by_requires_glob(project: Project):
-    (project.graphs_dir / "bad.yaml").write_text(
-        "name: bad\n"
-        "nodes:\n"
-        "  c: {type: collection, sources: [{path: sources/hello.txt}], group_by: parent}\n"
-        "  t: {type: transform, transformer: shout, inputs: {input: c}, expand: each}\n"
-    )
-    with pytest.raises(ValidationError, match="group_by"):
-        load_graph(project, "bad")
-
-
-def test_grouped_one_instance_per_dir(grouped_project: Project):
-    from smoketree.executor import run
-    from smoketree.cache import State
-
-    graph = load_graph(grouped_project, "g")
-    assert graph.is_collection("combine") is True
-    run(grouped_project, graph, take=0)
-    # one instance per subdirectory, not per file (3 files -> 2 groups)
-    assert len(State.load(grouped_project, "g").nodes["combine"]) == 2
-
-
-def test_grouped_input_concatenates_whole_group(grouped_project: Project):
-    from smoketree.executor import run
-
-    graph = load_graph(grouped_project, "g")
-    run(grouped_project, graph, take=0)
-    # the 'alpha' instance should have cat'd both alpha files (multi-file input)
-    outs = list(
-        (grouped_project.cache_dir / "g" / "combine").glob("*/take_0/text.txt")
-    )
-    contents = sorted(p.read_text() for p in outs)
-    assert "a-one\na-two\n" in contents          # group of 2 files combined
-    assert "b-three\n" in contents               # group of 1 file
-
-
-def test_grouped_cache_is_per_group(grouped_project: Project):
-    from smoketree.executor import run
-
-    graph = load_graph(grouped_project, "g")
-    run(grouped_project, graph, take=0)
-
-    # change one file in the 'alpha' group; only that group should rebuild
-    (grouped_project.sources_dir / "g" / "alpha" / "2.txt").write_text("a-two-EDIT\n")
-    lines: list[str] = []
-    run(grouped_project, graph, take=0, report=lines.append)
-    runs = [ln for ln in lines if ln.startswith("[RUN ]") and "combine" in ln]
-    skips = [ln for ln in lines if ln.startswith("[SKIP]") and "combine" in ln]
-    assert len(runs) == 1  # only alpha rebuilds
-    assert len(skips) == 1  # beta stays cached
-
-
-def test_encode_image_downscales_and_caps(tmp_path):
-    import base64 as _b64
-    import io as _io
-
-    from PIL import Image
-
-    from smoketree.images import encode_image
-
-    big = tmp_path / "big.png"
-    Image.new("RGB", (3000, 2000), "blue").save(big)
-
-    # capped to long edge 1536, aspect preserved
-    data, media_type = encode_image(big, 1536)
-    assert media_type == "image/png"
-    with Image.open(_io.BytesIO(_b64.b64decode(data))) as im:
-        assert max(im.size) == 1536
-        assert im.size == (1536, 1024)
-
-    # max_edge=0 disables resizing -> original dimensions
-    data0, _ = encode_image(big, 0)
-    with Image.open(_io.BytesIO(_b64.b64decode(data0))) as im0:
-        assert im0.size == (3000, 2000)
-
-
-def test_encode_image_never_upscales(tmp_path):
-    import base64 as _b64
-    import io as _io
-
-    from PIL import Image
-
-    from smoketree.images import encode_image
-
-    small = tmp_path / "small.jpg"
-    Image.new("RGB", (200, 150), "red").save(small)
-    data, media_type = encode_image(small, 1536)
-    assert media_type == "image/jpeg"
-    with Image.open(_io.BytesIO(_b64.b64decode(data))) as im:
-        assert im.size == (200, 150)  # unchanged, not upscaled
-
-
-def test_build_prompt_multi_image(tmp_path):
-    from smoketree.backends._prompt import build_prompt
-
-    a = tmp_path / "a.png"; a.write_bytes(b"\x89PNG\r\n")
-    b = tmp_path / "b.png"; b.write_bytes(b"\x89PNG\r\n")
-    arts = [
-        Artifact(path=a, media="image", format="png", content_hash="1"),
-        Artifact(path=b, media="image", format="png", content_hash="2"),
-    ]
-    text, images = build_prompt("look: {inputs.imgs}", {"imgs": arts})
-    assert len(images) == 2  # whole group attached
-    assert images == [a, b]
-
-
-# --------------------------------------------------------------------------- #
-# Tagged collections + filter_tag (Addendum 2)
-# --------------------------------------------------------------------------- #
-
-
-def test_input_ref_shorthand_equals_longform():
-    from smoketree.graph import InputRef
-    from smoketree.models import InputDecl
-
-    short = InputRef.parse("references[subject]")
-    long = InputRef.parse(InputDecl(node="references", filter_tag="subject"))
-    assert short == long
-    assert short.node_id == "references"
-    assert short.filter_tag == "subject"
-    assert short.output_name is None
-    # plain string still works
-    assert InputRef.parse("source").filter_tag is None
-
-
-def _tagged_refs_graph(project: Project, body: str) -> None:
-    for n in ("sub1", "sub2", "sty"):
-        _write(project.sources_dir / "refs" / f"{n}.txt", f"{n}\n")
-    (project.transformers_dir / "pair.yaml").write_text(_PAIR_TRANSFORMER)
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  references:\n"
-        "    type: collection\n"
-        "    sources:\n"
-        "      - {path: sources/refs/sub1.txt, tags: [subject, primary]}\n"
-        "      - {path: sources/refs/sub2.txt, tags: [subject]}\n"
-        "      - {path: sources/refs/sty.txt, tags: [style]}\n"
-        f"{body}"
-    )
-
-
-def test_filter_multi_fans_out(project: Project):
-    from smoketree.executor import run
-    from smoketree.cache import State
-
-    _tagged_refs_graph(
-        project,
-        "  prep: {type: transform, transformer: shout, "
-        "inputs: {input: 'references[subject]'}, expand: each}\n",
-    )
-    graph = load_graph(project, "g")
-    assert graph.is_collection("prep") is True
-    run(project, graph, take=0)
-    assert len(State.load(project, "g").nodes["prep"]) == 2  # two subject items
-
-
-def test_filter_single_is_scalar(project: Project):
-    from smoketree.executor import run
-
-    _tagged_refs_graph(
-        project,
-        "  prep: {type: transform, transformer: shout, "
-        "inputs: {input: 'references[style]'}}\n",  # 1 item -> scalar, no expand
-    )
-    graph = load_graph(project, "g")
-    assert graph.is_collection("prep") is False  # single match -> scalar
-    run(project, graph, take=0)
-    # flat (non-instance) cache layout for a scalar node
-    assert (cachelib.cache_node_dir(project, "g", "prep", 0) / "text.txt").exists()
-
-
-def test_filter_scalar_broadcasts_into_fanout(project: Project):
-    from smoketree.executor import run
-    from smoketree.cache import State
-
-    _tagged_refs_graph(
-        project,
-        "  prep: {type: transform, transformer: shout, "
-        "inputs: {input: 'references[subject]'}, expand: each}\n"
-        "  combo: {type: transform, transformer: pair, "
-        "inputs: {a: prep, b: 'references[style]'}, expand: each}\n",
-    )
-    graph = load_graph(project, "g")
-    run(project, graph, take=0)
-    # 2 subjects prepped, style broadcast -> 2 combo instances
-    assert len(State.load(project, "g").nodes["combo"]) == 2
-
-
-def test_filter_zero_match_errors(project: Project):
-    from smoketree.executor import run
-
-    _tagged_refs_graph(
-        project,
-        "  prep: {type: transform, transformer: shout, "
-        "inputs: {input: 'references[nope]'}}\n",
-    )
-    with pytest.raises(SmoketreeError, match="matched no items"):
-        run(project, load_graph(project, "g"), take=0)
-
-
-def test_filter_tag_on_noncollection_is_parse_error(project: Project):
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  src: {type: source, path: sources/hello.txt}\n"
-        "  p: {type: transform, transformer: shout, inputs: {input: 'src[x]'}}\n"
-    )
-    with pytest.raises(ValidationError, match="filter_tag"):
-        load_graph(project, "g")
-
-
-def test_collection_glob_and_sources_mutually_exclusive(project: Project):
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  c:\n"
-        "    type: collection\n"
-        "    glob: sources/*.txt\n"
-        "    sources: [{path: sources/hello.txt}]\n"
-        "  p: {type: transform, transformer: shout, inputs: {input: c}, expand: each}\n"
-    )
-    with pytest.raises(ValidationError, match="exactly one of 'glob' or 'sources'"):
-        load_graph(project, "g")
-
-
-def test_named_inputs_without_tagging(project: Project):
-    """Fixed named scalar source inputs feeding a multi-input transform."""
-    from smoketree.executor import run
-
-    _write(project.sources_dir / "x.txt", "x\n")
-    _write(project.sources_dir / "y.txt", "y\n")
-    (project.transformers_dir / "pair.yaml").write_text(_PAIR_TRANSFORMER)
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  sx: {type: source, path: sources/x.txt}\n"
-        "  sy: {type: source, path: sources/y.txt}\n"
-        "  joined: {type: transform, transformer: pair, inputs: {a: sx, b: sy}}\n"
-    )
-    graph = load_graph(project, "g")
-    assert graph.is_collection("joined") is False
-    run(project, graph, take=0)
-    out = (cachelib.cache_node_dir(project, "g", "joined", 0) / "text.txt").read_text()
-    assert out == "x\ny\n"
-
-
-def test_latent_media_type_validates(project: Project):
-    (project.transformers_dir / "enc.yaml").write_text(
-        "name: enc\n"
-        "type: comfyui\n"
-        "workflow: enc.json\n"
-        "inputs:\n"
-        "  image: {type: file, media: image, inject: {node_id: '4', field: image}}\n"
-        "outputs:\n"
-        "  latent: {type: file, media: latent, format: latent, "
-        "collect: {node_id: '8', field: filename_prefix}}\n"
-    )
-    (project.sources_dir / "pic.png").write_bytes(b"\x89PNG\r\n")
-    (project.graphs_dir / "g.yaml").write_text(
-        "name: g\n"
-        "nodes:\n"
-        "  src: {type: source, path: sources/pic.png}\n"
-        "  enc: {type: transform, transformer: enc, inputs: {image: src}}\n"
-    )
-    graph = load_graph(project, "g")  # latent output validates without error
-    assert graph.transformers["enc"].outputs["latent"].media == "latent"
+    write(tmp_path, "work/alpha/prompt.txt", "hello prompt")
+    run(project)
+    assert (tmp_path / "work/alpha/portrait.png").read_bytes() == b"IMGBYTES"

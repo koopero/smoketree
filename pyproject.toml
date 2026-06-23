@@ -14,6 +14,17 @@ dependencies = [
     "pillow>=10.0",
 ]
 
+[project.optional-dependencies]
+# `smoketree workspace` — the interactive feedback web app.
+workspace = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+# `replicate` transformers — render with hosted models over the Replicate API.
+replicate = [
+    "replicate>=0.32",
+]
+
 [project.scripts]
 smoketree = "smoketree.cli:app"
 
@@ -27,4 +38,6 @@ packages = ["src/smoketree"]
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]

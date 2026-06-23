@@ -1,8 +1,9 @@
-"""Shared prompt assembly for LLM backends (Claude, Ollama).
+"""Shared prompt assembly for LLM backends on the path core.
 
-Walks ``{inputs.NAME}`` references in a prompt template: text/data inputs are read and
-inlined at their token; image inputs are removed from the text and returned separately
-so each backend can attach them in its own wire format.
+A prompt/system template references inputs and keys by ``{name}``: text/data inputs are
+read and inlined at their token; image inputs are dropped from the text and returned
+separately so each backend attaches them in its own wire format; a ``{key}`` substitutes
+its value.
 """
 
 from __future__ import annotations
@@ -10,38 +11,40 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from ..cache import Artifact
 from ..errors import ExecutionError
+from ..media import infer_media
 
-_TOKEN = re.compile(r"\{inputs\.([a-zA-Z0-9_]+)\}")
+_TOKEN = re.compile(r"\{(\w+)\}")
 
 
-def build_prompt(
-    template: str, inputs: "dict[str, Artifact | list[Artifact]]"
+def render_prompt(
+    template: str,
+    inputs: "dict[str, Path | list[Path]]",
+    keys: dict[str, str],
 ) -> tuple[str, list[Path]]:
-    """Return the interpolated prompt text and the list of image input paths.
-
-    An input may be a single artifact or a list (a grouped/multi-file input): a
-    multi-image input attaches every image; multi text/data inputs are concatenated.
-    """
+    """Return the interpolated text and the list of image input paths it referenced."""
     images: list[Path] = []
 
-    def _one(artifact: Artifact) -> str:
-        if artifact.media in ("text", "data"):
-            return artifact.path.read_text()
-        if artifact.media == "image":
-            images.append(artifact.path)
+    def _one(path: Path) -> str:
+        media = infer_media(path)
+        if media in ("text", "data"):
+            return path.read_text()
+        if media == "image":
+            images.append(path)
             return ""
-        raise ExecutionError(
-            f"Cannot embed media type '{artifact.media}' in a prompt."
-        )
+        raise ExecutionError(f"Cannot embed media '{media}' ({path}) in a prompt.")
 
     def repl(match: re.Match[str]) -> str:
         name = match.group(1)
-        value = inputs.get(name)
-        if value is None:
-            raise ExecutionError(f"Prompt references unknown input '{name}'.")
-        artifacts = value if isinstance(value, list) else [value]
-        return "\n\n".join(_one(a) for a in artifacts)
+        if name in inputs:
+            value = inputs[name]
+            paths = value if isinstance(value, list) else [value]
+            return "\n\n".join(_one(p) for p in paths)
+        if name in keys:
+            return keys[name]
+        raise ExecutionError(
+            f"Prompt references unknown input/key '{{{name}}}'. "
+            f"Inputs: {', '.join(inputs) or '(none)'}; keys: {', '.join(keys) or '(none)'}."
+        )
 
     return _TOKEN.sub(repl, template), images
