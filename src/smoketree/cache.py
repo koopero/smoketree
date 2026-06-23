@@ -2,7 +2,10 @@
 
 Staleness is content-addressed: a job's *input hash* is the SHA-256 of its resolved
 input file contents plus its rendered command. State maps each job's identity
-(rule name + key-tuple) to the input hash recorded at its last successful run.
+(rule name + key-tuple) to the input hash recorded at its last successful run, plus a
+cheap *fingerprint* (mtime+size of each input) that gates the content hash: when the
+fingerprint is unchanged, the inputs are assumed unchanged and the file contents are
+not re-read. The content hash remains the machine-independent source of truth.
 """
 
 from __future__ import annotations
@@ -37,6 +40,8 @@ def hash_text(text: str) -> str:
 class JobState:
     input_hash: str
     completed_at: str
+    # cheap mtime+size fingerprint of the inputs at record time; gates the content hash
+    fingerprint: str = ""
 
 
 class State:
@@ -60,19 +65,27 @@ class State:
                 state.jobs[identity] = JobState(
                     input_hash=raw["input_hash"],
                     completed_at=raw.get("completed_at", ""),
+                    fingerprint=raw.get("fingerprint", ""),
                 )
         return state
 
     def get(self, identity: str) -> JobState | None:
         return self.jobs.get(identity)
 
-    def record(self, identity: str, input_hash: str) -> None:
+    def record(self, identity: str, input_hash: str, fingerprint: str = "") -> None:
         self.jobs[identity] = JobState(
             input_hash=input_hash,
             completed_at=datetime.now(timezone.utc)
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
+            fingerprint=fingerprint,
         )
+
+    def touch_fingerprint(self, identity: str, fingerprint: str) -> None:
+        """Refresh only the fingerprint of an existing record (content confirmed equal)."""
+        job = self.jobs.get(identity)
+        if job is not None:
+            job.fingerprint = fingerprint
 
     def clear(self) -> None:
         self.jobs.clear()
@@ -84,6 +97,7 @@ class State:
                 identity: {
                     "input_hash": js.input_hash,
                     "completed_at": js.completed_at,
+                    "fingerprint": js.fingerprint,
                 }
                 for identity, js in sorted(self.jobs.items())
             }

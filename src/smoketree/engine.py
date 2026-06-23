@@ -51,6 +51,27 @@ def _input_hash(binding: Binding) -> str:
     return hash_text("\n".join(parts))
 
 
+def _input_fingerprint(binding: Binding) -> str:
+    """A cheap mtime+size fingerprint of the inputs plus the transform text.
+
+    Machine-local and not a correctness authority — it only decides whether the
+    content hash is worth recomputing. A miss falls through to the content hash;
+    a match skips re-reading (potentially large) input files.
+    """
+    parts: list[str] = []
+    for name in sorted(binding.inputs):
+        value = binding.inputs[name]
+        paths = value if isinstance(value, list) else [value]
+        for path in sorted(paths):
+            try:
+                st = path.stat()
+                parts.append(f"{name}:{path}:{st.st_mtime_ns}:{st.st_size}")
+            except OSError:
+                parts.append(f"{name}:{path}:missing")
+    parts.append(f"transform:{binding.transform_fingerprint}")
+    return hash_text("\n".join(parts))
+
+
 def _known_key_values(root: Path, loaded: LoadedPipeline) -> dict[str, set[str]]:
     """Every value seen for each ``{key}`` by globbing all rules' input patterns.
 
@@ -112,16 +133,26 @@ def _inputs_present(binding: Binding) -> bool:
 
 
 def _staleness(binding: Binding, state: State) -> tuple[bool, str]:
-    """Return (is_stale, reason)."""
+    """Return (is_stale, reason).
+
+    A cheap mtime+size fingerprint gates the content hash: an unchanged fingerprint
+    means up-to-date without re-reading inputs. A moved fingerprint falls through to
+    the content hash — if the contents are in fact identical (e.g. a touched file),
+    the stored fingerprint is refreshed so the next pass is cheap again.
+    """
     record = state.get(binding.identity)
     if record is None:
         return True, "new"
     missing = [p for p in binding.enumerable_outputs if not p.exists()]
     if missing:
         return True, "output missing"
-    if record.input_hash != _input_hash(binding):
-        return True, "inputs changed"
-    return False, "up to date"
+    fingerprint = _input_fingerprint(binding)
+    if record.fingerprint and record.fingerprint == fingerprint:
+        return False, "up to date"
+    if record.input_hash == _input_hash(binding):
+        state.touch_fingerprint(binding.identity, fingerprint)
+        return False, "up to date"
+    return True, "inputs changed"
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +250,9 @@ def run(
             report(f"[run ] {binding.identity}  ({reason})")
             run_start = time.time()
             _execute(project, binding, report)
-            state.record(binding.identity, _input_hash(binding))
+            state.record(
+                binding.identity, _input_hash(binding), _input_fingerprint(binding)
+            )
             # Persist after every job: an expensive run that fails partway (a paid
             # render, a throttle) must not lose — or re-bill — the work already done.
             state.save()
