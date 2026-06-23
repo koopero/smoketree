@@ -1,9 +1,9 @@
 """The local web app behind ``smoketree workspace`` (path core).
 
 A tiny FastAPI app (no build step, vanilla HTML/JS): a card grid of every rendered output
-whose rule declares a ``feedback.append`` channel, each with a note box that saves to the
-channel file, plus a Run button that re-runs the pipeline (folding the new feedback) and
-streams progress — closing the human-in-the-loop cycle in the browser.
+whose rule declares one or more ``feedback`` channels, each rendered as a notes box or a
+select control that saves to the channel file, plus a Run button that re-runs the pipeline
+(folding the new feedback) and streams progress — closing the loop in the browser.
 
 ``fastapi``/``uvicorn`` are optional (the ``workspace`` extra); imported lazily.
 """
@@ -18,12 +18,19 @@ from pydantic import BaseModel
 
 from ..errors import SmoketreeError
 from ..project import Project
-from .index import add_note, build_index
+from .index import add_note, build_index, set_select
 
 
 class NoteIn(BaseModel):
     id: str
+    channel: str
     text: str
+
+
+class SelectIn(BaseModel):
+    id: str
+    channel: str
+    value: str
 
 
 def _require_fastapi():
@@ -38,14 +45,25 @@ def _require_fastapi():
 
 
 def _card_json(card) -> dict:
-    # Note the channel's *content* is never sent: the box is write-only (append). Only
-    # `has_note` is exposed, to show the "noted" highlight.
+    # A notes channel's *text* is never sent (the box is write-only); only `has_note` is
+    # exposed for the highlight. A select channel sends its current value + options.
+    channels = []
+    for c in card.channels:
+        cj = {"name": c.name, "kind": c.kind, "describe": c.describe}
+        if c.kind == "select":
+            cj["options"] = c.options
+            cj["value"] = c.value
+            cj["default"] = c.default
+        else:
+            cj["has_note"] = c.has_note
+        channels.append(cj)
     return {
         "id": card.id,
         "rule": card.rule,
         "label": card.label,
         "media": card.media,
-        "has_note": card.has_note,
+        "flagged": card.flagged,
+        "channels": channels,
         "artifact_url": f"/artifact?id={card.id}",
     }
 
@@ -73,6 +91,17 @@ def create_app(project: Project, pipeline_id: str):
                 return card
         raise HTTPException(status_code=404, detail="Unknown output.")
 
+    def _find_channel(card_id: str, channel_name: str):
+        card = _find_card(card_id)
+        for channel in card.channels:
+            if channel.name == channel_name:
+                return channel
+        raise HTTPException(status_code=404, detail="Unknown channel.")
+
+    def _guard_in_project(path) -> None:
+        if not str(path.resolve()).startswith(str(project.root.resolve())):
+            raise HTTPException(status_code=400, detail="Refusing path outside project.")
+
     @app.get("/", response_class=HTMLResponse)
     def home() -> str:
         return _PAGE.replace("__PIPELINE__", pipeline_id)
@@ -94,12 +123,24 @@ def create_app(project: Project, pipeline_id: str):
 
     @app.post("/api/note")
     def post_note(note: NoteIn) -> JSONResponse:
-        card = _find_card(note.id)
-        path = card.note_path.resolve()
-        if not str(path).startswith(str(project.root.resolve())):
-            raise HTTPException(status_code=400, detail="Refusing path outside project.")
-        has_note = add_note(card, note.text)
+        channel = _find_channel(note.id, note.channel)
+        if channel.kind != "notes":
+            raise HTTPException(status_code=400, detail="Channel is not a notes channel.")
+        _guard_in_project(channel.path)
+        has_note = add_note(channel, note.text)
         return JSONResponse({"ok": True, "has_note": has_note})
+
+    @app.post("/api/select")
+    def post_select(sel: SelectIn) -> JSONResponse:
+        channel = _find_channel(sel.id, sel.channel)
+        if channel.kind != "select":
+            raise HTTPException(status_code=400, detail="Channel is not a select channel.")
+        _guard_in_project(channel.path)
+        try:
+            value = set_select(channel, sel.value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse({"ok": True, "value": value})
 
     @app.post("/api/run")
     def run_pipeline() -> StreamingResponse:
@@ -189,7 +230,7 @@ _PAGE = """\
          grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
   .card { background: #1c1f26; border: 1px solid #2a2d34; border-radius: 10px;
           overflow: hidden; display: flex; flex-direction: column; }
-  .card.noted { border-color: #d8a657; }
+  .card.flagged { border-color: #d8a657; }
   .card .head { padding: 10px 12px; border-bottom: 1px solid #2a2d34;
                 display: flex; align-items: center; gap: 8px; }
   .card .node { font-weight: 600; }
@@ -197,7 +238,7 @@ _PAGE = """\
                  text-overflow: ellipsis; white-space: nowrap; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: #3a3d44;
          flex: none; margin-left: auto; }
-  .card.noted .dot { background: #d8a657; }
+  .card.flagged .dot { background: #d8a657; }
   .preview { background: #0f1115; min-height: 80px; display: flex;
              align-items: center; justify-content: center; }
   .preview img { max-width: 100%; max-height: 320px; display: block; }
@@ -205,11 +246,11 @@ _PAGE = """\
   .preview pre { margin: 0; padding: 12px; max-height: 240px; overflow: auto;
                  white-space: pre-wrap; font-size: 12px; width: 100%; color: #c8ccd4; }
   .preview .none { color: #6b6f78; padding: 24px; font-size: 12px; }
-  textarea { width: 100%; border: none; border-top: 1px solid #2a2d34;
-             background: #1c1f26; color: #e8e8ea; padding: 10px 12px;
-             font: 13px/1.5 system-ui, sans-serif; resize: vertical; min-height: 64px; }
-  textarea:focus { outline: none; background: #21252e; }
-  .noterow { display: flex; align-items: center; gap: 10px; padding: 8px 12px 12px; }
+  textarea { width: 100%; border: 1px solid #2a2d34; border-radius: 6px;
+             background: #14161a; color: #e8e8ea; padding: 8px 10px;
+             font: 13px/1.5 system-ui, sans-serif; resize: vertical; min-height: 56px; }
+  textarea:focus { outline: none; border-color: #4a4f59; }
+  .noterow { display: flex; align-items: center; gap: 10px; padding: 6px 0 0; }
   button.addnote { background: #262a33; color: #cdd2db; border: 1px solid #3a3d44;
                    border-radius: 7px; padding: 6px 12px; cursor: pointer;
                    font: 600 12px/1 system-ui, sans-serif; }
@@ -217,6 +258,17 @@ _PAGE = """\
   button.addnote:disabled { opacity: 0.5; cursor: default; }
   .saved { font-size: 11px; color: #7bbf7b; }
   .hint { font-size: 11px; color: #6b6f78; margin-left: auto; }
+  .channels { display: flex; flex-direction: column; }
+  .channel { border-top: 1px solid #2a2d34; padding: 9px 12px 11px; }
+  .chead { font-size: 11px; font-weight: 600; color: #aab2bd; text-transform: uppercase;
+           letter-spacing: .04em; margin-bottom: 6px; }
+  .chead .desc { font-weight: 400; text-transform: none; letter-spacing: 0; color: #8b8f98; }
+  .select { display: flex; flex-wrap: wrap; gap: 6px; }
+  button.opt { background: #262a33; color: #cdd2db; border: 1px solid #3a3d44;
+               border-radius: 999px; padding: 5px 12px; cursor: pointer;
+               font: 600 12px/1 system-ui, sans-serif; }
+  button.opt:hover { border-color: #4a4f59; }
+  button.opt.active { background: #2f6f4f; color: #eafff2; border-color: #3a8a63; }
   .empty { color: #8b8f98; padding: 24px; }
 </style>
 </head>
@@ -249,9 +301,30 @@ async function preview(card) {
   return `<div class="none"><a href="${url}">download ${card.media}</a></div>`;
 }
 
-function bindNote(el, card) {
-  // Write-only append box: submit a new note explicitly (button or ⌘/Ctrl+Enter), then
-  // clear for the next one. No save-on-blur. Never pre-filled with prior feedback.
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function isFlagged(card) {
+  return card.channels.some(c => c.kind === 'notes' ? c.has_note : c.value !== c.default);
+}
+function updateFlag(card) { card.cardEl.classList.toggle('flagged', isFlagged(card)); }
+
+function chHead(ch) {
+  return `<div class="chead">${esc(ch.name)}` +
+    (ch.describe ? ` — <span class="desc">${esc(ch.describe)}</span>` : '') + `</div>`;
+}
+
+function notesChannel(card, ch) {
+  // Write-only append box: submit explicitly (button or ⌘/Ctrl+Enter), then clear.
+  const el = document.createElement('div');
+  el.className = 'channel';
+  el.innerHTML = chHead(ch) + `
+    <textarea placeholder="Add a note…"></textarea>
+    <div class="noterow">
+      <button class="addnote" type="button">Add note</button>
+      <span class="saved"></span><span class="hint">⌘/Ctrl + Enter</span>
+    </div>`;
   const textarea = el.querySelector('textarea');
   const btn = el.querySelector('.addnote');
   const savedEl = el.querySelector('.saved');
@@ -261,11 +334,10 @@ function bindNote(el, card) {
     try {
       const r = await fetch('/api/note', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({id: card.id, text: textarea.value}),
+        body: JSON.stringify({id: card.id, channel: ch.name, text: textarea.value}),
       });
       const j = await r.json();
-      textarea.value = '';
-      card.cardEl.classList.toggle('noted', j.has_note);
+      textarea.value = ''; ch.has_note = j.has_note; updateFlag(card);
       savedEl.textContent = 'added';
       setTimeout(() => { savedEl.textContent = ''; }, 1500);
     } finally { btn.disabled = false; }
@@ -274,6 +346,33 @@ function bindNote(el, card) {
   textarea.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); add(); }
   });
+  return el;
+}
+
+function selectChannel(card, ch) {
+  const el = document.createElement('div');
+  el.className = 'channel';
+  el.innerHTML = chHead(ch) + `<div class="select">` +
+    ch.options.map(o =>
+      `<button class="opt${o === ch.value ? ' active' : ''}" type="button" ` +
+      `data-v="${esc(o)}">${esc(o)}</button>`).join('') + `</div>`;
+  el.querySelectorAll('.opt').forEach(b => b.addEventListener('click', async () => {
+    const v = b.getAttribute('data-v');
+    const r = await fetch('/api/select', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id: card.id, channel: ch.name, value: v}),
+    });
+    if (!r.ok) return;
+    ch.value = v;
+    el.querySelectorAll('.opt').forEach(x =>
+      x.classList.toggle('active', x.getAttribute('data-v') === v));
+    updateFlag(card);
+  }));
+  return el;
+}
+
+function channelEl(card, ch) {
+  return ch.kind === 'select' ? selectChannel(card, ch) : notesChannel(card, ch);
 }
 
 async function render() {
@@ -287,23 +386,19 @@ async function render() {
   grid.innerHTML = '';
   for (const card of data.cards) {
     const el = document.createElement('div');
-    el.className = 'card' + (card.has_note ? ' noted' : '');
+    el.className = 'card' + (card.flagged ? ' flagged' : '');
     card.cardEl = el;
     el.innerHTML = `
       <div class="head">
-        <span class="node">${card.rule}</span>
-        <span class="label">${card.label}</span>
+        <span class="node">${esc(card.rule)}</span>
+        <span class="label">${esc(card.label)}</span>
         <span class="dot"></span>
       </div>
       <div class="preview">${await preview(card)}</div>
-      <textarea placeholder="Add feedback…"></textarea>
-      <div class="noterow">
-        <button class="addnote" type="button">Add note</button>
-        <span class="saved"></span>
-        <span class="hint">⌘/Ctrl + Enter</span>
-      </div>`;
+      <div class="channels"></div>`;
+    const wrap = el.querySelector('.channels');
+    for (const ch of card.channels) wrap.appendChild(channelEl(card, ch));
     grid.appendChild(el);
-    bindNote(el, card);
   }
 }
 

@@ -108,30 +108,44 @@ into a downstream `{port}` prompt reference like any other input.
 
 ## Human-in-the-loop feedback
 
-A rule can declare a **feedback channel** attached to its output:
+A rule can declare one or more **feedback channels** attached to its output. Each is an
+authored file smoketree seeds once per discovered key-tuple and never clobbers:
 
 ```yaml
-- name: portrait
-  in:  { prompt: "work/{m}/prompt.txt" }
-  out: { image: "work/{m}/portrait.png" }
-  backend: replicate
+- name: idea
+  in:  { brief: "sources/brief.txt" }
+  out: { draft: "brainstorm/ideas/{idea}/draft.md" }
+  backend: claude
   feedback:
-    append: "feedback/{m}/portrait.md"   # keyed by a subset of the rule's keys
+    - name: content                                  # free-text log (default kind)
+      path: "brainstorm/ideas/{idea}/notes.md"
+      describe: "Notes on this idea's direction."
+    - name: status                                   # a single choice
+      path: "brainstorm/ideas/{idea}/status.yaml"
+      kind: select
+      options: [pending, approve, ignore, recycle]   # default = options[0]
+      describe: "Triage this idea."
   config: { ... }
 ```
 
-smoketree **seeds** that notes file once per discovered key-tuple (`(no feedback yet)`) and
-never clobbers it — so a human (the feedback *generator*) can write notes there. A separate
-rule typically compiles the notes into a directive the prompt consumes, closing the loop:
+- **`notes`** (the default kind) seeds `(no feedback yet)` and accumulates a human's text.
+- **`select`** seeds `{name}: {default}` (with the options in a comment) — a single choice,
+  validated against `options`. The file is YAML data downstream rules can read and gate on.
+
+`name` (defaulting to the kind) must be unique within a rule; the `path` is keyed by a
+subset of the rule's keys. Channels are **plain files consumed downstream as ordinary
+inputs** — this block only governs seeding and the workspace UI. A separate rule typically
+compiles notes into a directive the prompt consumes, closing the loop:
 
 ```
-feedback/{m}/portrait.md  ──►  fb (ollama: notes -> directive)  ──►  prompt -> render
-        ▲                                                                     │
-        └──────────────── human edits the note (workspace or editor) ◄────────┘
+.../notes.md  ──►  fb (ollama: notes -> directive)  ──►  prompt -> render
+      ▲                                                          │
+      └──────────── human edits the note (workspace or editor) ◄─┘
 ```
 
-`smoketree workspace <id>` serves a local gallery of every rendered output that has a
-`feedback:` channel; type a note on a card and it saves to that output's channel file.
+`smoketree workspace <id>` serves a local gallery of every rendered output that has any
+`feedback:` channel — a notes box or a select control per channel (with its `describe`),
+saving to the channel file.
 
 ## CLI
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MediaType = Literal["image", "audio", "video", "text", "data", "latent"]
 MEDIA_TYPES: tuple[str, ...] = ("image", "audio", "video", "text", "data", "latent")
@@ -46,19 +46,54 @@ class ProjectConfig(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
-class FeedbackSpec(BaseModel):
-    """A feedback channel attached to an (output) rule.
+class FeedbackChannel(BaseModel):
+    """One human-feedback channel attached to a rule's output.
 
-    ``append`` is a path-pattern (keyed by a subset of the rule's keys) for a
-    human-authored notes file that smoketree **seeds** once per discovered key-tuple
-    (placeholder ``(no feedback yet)``) and thereafter never clobbers. The render rule
-    that declares it *owns* the channel; a separate compile rule typically reads the
-    file and turns the notes into a directive. Notes are meant to accumulate (append).
+    ``path`` is a path-pattern (keyed by a subset of the rule's keys) for an authored
+    file smoketree **seeds** once per discovered key-tuple and never clobbers. ``kind``
+    picks the seed + workspace widget:
+
+    - ``notes`` — a free-text log, seeded with a placeholder (``(no feedback yet)``);
+    - ``select`` — a single choice among ``options``, seeded as ``{name}: {default}``
+      (``default`` defaults to ``options[0]``).
+
+    ``describe`` is shown to the human in the workspace. Channels are plain files,
+    consumed downstream as ordinary inputs — this block only governs seeding and
+    workspace surfacing. ``name`` (defaulting to ``kind``) identifies the channel and
+    must be unique within a rule.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    append: str
+    name: str | None = None
+    path: str
+    kind: Literal["notes", "select"] = "notes"
+    describe: str | None = None
+    options: list[str] = Field(default_factory=list)  # select only
+    default: str | None = None                          # select only
+
+    @model_validator(mode="after")
+    def _check(self) -> "FeedbackChannel":
+        if self.name is None:
+            self.name = self.kind
+        if self.kind == "select":
+            if not self.options:
+                raise ValueError(
+                    f"feedback channel '{self.name}': kind 'select' needs non-empty 'options'."
+                )
+            if self.default is None:
+                self.default = self.options[0]
+            elif self.default not in self.options:
+                raise ValueError(
+                    f"feedback channel '{self.name}': default '{self.default}' is not in "
+                    f"options {self.options}."
+                )
+        elif self.options or self.default is not None:
+            raise ValueError(
+                f"feedback channel '{self.name}': 'options'/'default' apply only to "
+                f"kind 'select'."
+            )
+        return self
 
 
 class Rule(BaseModel):
@@ -80,8 +115,8 @@ class Rule(BaseModel):
     # set false to turn a rule (a whole stage) off without deleting it: it never binds,
     # runs, seeds its feedback, or surfaces in the workspace. Flip back to re-enable.
     enabled: bool = True
-    # a human-feedback channel attached to this rule's output (seeded, never clobbered)
-    feedback: FeedbackSpec | None = None
+    # human-feedback channels attached to this rule's output (seeded, never clobbered)
+    feedback: list[FeedbackChannel] = Field(default_factory=list)
     # port name -> path of a JSON Schema (authored in YAML) the engine validates that
     # port's data against. An output-port schema also constrains LLM backends. Schema
     # files are dependencies: editing one re-runs and re-validates the rule.

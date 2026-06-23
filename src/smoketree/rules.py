@@ -79,12 +79,17 @@ def _validate(pipeline_id: str, pipeline: Pipeline) -> None:
                 f"{', '.join(sorted(ports)) or '(none)'}."
             )
 
-        if rule.feedback is not None:
-            fb_keys = set(Pattern.compile(rule.feedback.append).keys)
-            unknown = fb_keys - (in_keys | out_keys)
+        fb_names: set[str] = set()
+        for channel in rule.feedback:
+            if channel.name in fb_names:
+                raise ValidationError(
+                    f"Rule '{rule.name}': duplicate feedback channel name '{channel.name}'."
+                )
+            fb_names.add(channel.name)
+            unknown = set(Pattern.compile(channel.path).keys) - (in_keys | out_keys)
             if unknown:
                 raise ValidationError(
-                    f"Rule '{rule.name}': feedback.append uses key(s) "
+                    f"Rule '{rule.name}': feedback channel '{channel.name}' uses key(s) "
                     f"{', '.join(sorted(unknown))} that the rule doesn't bind. "
                     f"Keys available: {', '.join(sorted(in_keys | out_keys)) or '(none)'}."
                 )

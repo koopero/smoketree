@@ -312,7 +312,7 @@ def test_max_iterations_breaker(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- #
-# feedback.append: seeded feedback channel attached to an output rule
+# feedback channels: seeded feedback files attached to an output rule
 # --------------------------------------------------------------------------- #
 
 
@@ -328,7 +328,7 @@ FEEDBACK_PIPE = (
     '    out:\n      art: "work/{m}/art.txt"\n'
     '    run: "cat {brief} {directive} > {art}"\n'
     "    feedback:\n"
-    '      append: "feedback/{m}/notes.md"\n'
+    '      - path: "feedback/{m}/notes.md"\n'
 )
 
 
@@ -393,7 +393,7 @@ def test_feedback_unknown_key_rejected(tmp_path: Path):
         '    in:\n      a: "src/{m}.txt"\n'
         '    out:\n      b: "out/{m}.txt"\n    run: "cp {a} {b}"\n'
         "    feedback:\n"
-        '      append: "feedback/{other}/notes.md"\n',
+        '      - path: "feedback/{other}/notes.md"\n',
     )
     with pytest.raises(SmoketreeError):
         load_pipeline(project, "g")
@@ -411,7 +411,7 @@ WORKSPACE_PIPE = (
     '    out:\n      image: "work/{m}/out.png"\n'
     '    run: "cp {prompt} {image}"\n'
     "    feedback:\n"
-    '      append: "feedback/{m}/notes.md"\n'
+    '      - path: "feedback/{m}/notes.md"\n'
 )
 
 
@@ -430,19 +430,22 @@ def test_workspace_index_pairs_output_with_channel(tmp_path: Path):
     assert card.rule == "render"
     assert card.media == "image"
     assert card.output_path == tmp_path / "work/a/out.png"
-    assert card.note_path == tmp_path / "feedback/a/notes.md"
-    assert card.has_note is False
+    assert len(card.channels) == 1
+    ch = card.channels[0]
+    assert ch.name == "notes" and ch.kind == "notes"
+    assert ch.path == tmp_path / "feedback/a/notes.md"
+    assert ch.has_note is False and card.flagged is False
 
     # first note replaces the (absent/placeholder) channel content
-    assert add_note(card, "make it brighter") is True
+    assert add_note(ch, "make it brighter") is True
     assert (tmp_path / "feedback/a/notes.md").read_text() == "make it brighter\n"
 
     # a second note APPENDS (the channel is an accumulating log)
-    assert add_note(card, "and bigger") is True
+    assert add_note(ch, "and bigger") is True
     assert (tmp_path / "feedback/a/notes.md").read_text() == "make it brighter\nand bigger\n"
 
     # an empty submission is a no-op (never empties a pipeline-input channel)
-    add_note(card, "   ")
+    add_note(ch, "   ")
     assert (tmp_path / "feedback/a/notes.md").read_text() == "make it brighter\nand bigger\n"
 
 
@@ -453,9 +456,9 @@ def test_workspace_replaces_seed_placeholder(tmp_path: Path):
     write(tmp_path, "work/a/out.png", "img-a")
     write(tmp_path, "feedback/a/notes.md", "(no feedback yet)\n")  # seeded, untouched
 
-    card = build_index(project, "g")[0]
-    assert card.has_note is False  # placeholder doesn't count as a note
-    add_note(card, "first real note")
+    ch = build_index(project, "g")[0].channels[0]
+    assert ch.has_note is False  # placeholder doesn't count as a note
+    add_note(ch, "first real note")
     assert (tmp_path / "feedback/a/notes.md").read_text() == "first real note\n"
 
 
@@ -464,6 +467,126 @@ def test_workspace_index_empty_before_render(tmp_path: Path):
 
     project = make_project(tmp_path, WORKSPACE_PIPE)
     assert build_index(project, "g") == []  # no outputs on disk yet
+
+
+# --------------------------------------------------------------------------- #
+# Multiple described channels: notes + select
+# --------------------------------------------------------------------------- #
+
+
+MULTI_CHANNEL_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: render\n"
+    '    in:\n      prompt: "sources/{m}/p.txt"\n'
+    '    out:\n      art: "work/{m}/art.txt"\n'
+    '    run: "cp {prompt} {art}"\n'
+    "    feedback:\n"
+    '      - { name: content, path: "feedback/{m}/content.md", describe: "Notes." }\n'
+    '      - name: status\n'
+    '        path: "brainstorm/ideas/{m}/status.yaml"\n'
+    "        kind: select\n"
+    "        options: [pending, approve, ignore, recycle]\n"
+    '        describe: "Triage this idea."\n'
+)
+
+
+def test_select_channel_seeds_default(tmp_path: Path):
+    project = make_project(tmp_path, MULTI_CHANNEL_PIPE)
+    write(tmp_path, "sources/alpha/p.txt", "an idea\n")
+    run(project)
+
+    notes = (tmp_path / "feedback/alpha/content.md").read_text()
+    assert notes == "(no feedback yet)\n"
+    status = (tmp_path / "brainstorm/ideas/alpha/status.yaml").read_text()
+    assert "status: pending" in status  # seeded with the default (options[0])
+    assert "approve" in status and "recycle" in status  # options documented in a comment
+    import yaml as _yaml
+
+    assert _yaml.safe_load(status) == {"status": "pending"}
+
+
+def test_select_invalid_default_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n  - name: r\n"
+        '    in:\n      a: "src/{m}.txt"\n'
+        '    out:\n      b: "out/{m}.txt"\n    run: "cp {a} {b}"\n'
+        "    feedback:\n"
+        '      - name: status\n        path: "s/{m}.yaml"\n        kind: select\n'
+        "        options: [a, b]\n        default: zzz\n",
+    )
+    with pytest.raises(SmoketreeError, match="not in options"):
+        load_pipeline(project, "g")
+
+
+def test_workspace_renders_and_sets_select(tmp_path: Path):
+    from smoketree.workspace.index import build_index, set_select
+
+    project = make_project(tmp_path, MULTI_CHANNEL_PIPE)
+    write(tmp_path, "sources/alpha/p.txt", "an idea\n")
+    run(project)  # renders + seeds both channels
+
+    card = build_index(project, "g")[0]
+    by_name = {c.name: c for c in card.channels}
+    assert set(by_name) == {"content", "status"}
+    sel = by_name["status"]
+    assert sel.kind == "select" and sel.options[0] == "pending"
+    assert sel.value == "pending" and card.flagged is False  # default = untouched
+
+    set_select(sel, "approve")
+    card2 = build_index(project, "g")[0]
+    status = {c.name: c for c in card2.channels}["status"]
+    assert status.value == "approve"
+    assert card2.flagged is True  # a non-default selection flags the card
+
+
+def test_set_select_rejects_unknown_value(tmp_path: Path):
+    from smoketree.workspace.index import build_index, set_select
+
+    project = make_project(tmp_path, MULTI_CHANNEL_PIPE)
+    write(tmp_path, "sources/alpha/p.txt", "an idea\n")
+    run(project)
+    sel = {c.name: c for c in build_index(project, "g")[0].channels}["status"]
+    with pytest.raises(ValueError):
+        set_select(sel, "bogus")
+
+
+def test_workspace_server_select_and_note(tmp_path: Path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from smoketree.workspace.server import create_app
+
+    project = make_project(tmp_path, MULTI_CHANNEL_PIPE)
+    write(tmp_path, "sources/alpha/p.txt", "an idea\n")
+    run(project)
+
+    client = TestClient(create_app(project, "g"))
+    cards = client.get("/api/index").json()["cards"]
+    assert len(cards) == 1
+    card = cards[0]
+    chans = {c["name"]: c for c in card["channels"]}
+    assert chans["status"]["kind"] == "select" and chans["status"]["value"] == "pending"
+    assert chans["content"]["kind"] == "notes"
+
+    # set the select channel
+    r = client.post("/api/select", json={"id": card["id"], "channel": "status", "value": "approve"})
+    assert r.status_code == 200 and r.json()["value"] == "approve"
+    assert (tmp_path / "brainstorm/ideas/alpha/status.yaml").read_text().endswith(
+        "status: approve\n"
+    )
+
+    # an out-of-range selection is rejected
+    bad = client.post("/api/select", json={"id": card["id"], "channel": "status", "value": "nope"})
+    assert bad.status_code == 400
+
+    # append a note to the notes channel
+    n = client.post("/api/note", json={"id": card["id"], "channel": "content", "text": "brighter"})
+    assert n.status_code == 200 and n.json()["has_note"] is True
+    assert (tmp_path / "feedback/alpha/content.md").read_text() == "brighter\n"
+
+    # after edits the card reports flagged
+    assert client.get("/api/index").json()["cards"][0]["flagged"] is True
 
 
 # --------------------------------------------------------------------------- #

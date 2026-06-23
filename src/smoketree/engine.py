@@ -109,27 +109,41 @@ def _known_key_values(root: Path, loaded: LoadedPipeline) -> dict[str, set[str]]
     return values
 
 
-def _seed_feedback(project: Project, loaded: LoadedPipeline, report: Reporter) -> None:
-    """Seed each rule's ``feedback.append`` file for every discovered key-tuple.
+def _channel_seed(channel) -> str:
+    """Initial content for a feedback channel file (never overwrites an existing one)."""
+    if channel.kind == "select":
+        lines: list[str] = []
+        if channel.describe:
+            lines.append(f"# {channel.describe}")
+        lines.append(f"# options: {' | '.join(channel.options)}")
+        lines.append(f"{channel.name}: {channel.default}")
+        return "\n".join(lines) + "\n"
+    return _SEED_PLACEHOLDER  # notes
 
-    Seeded once (when absent) with a placeholder; an existing file is never clobbered,
-    so human notes survive. Deleting a feedback file re-seeds it on the next pass.
+
+def _seed_feedback(project: Project, loaded: LoadedPipeline, report: Reporter) -> None:
+    """Seed each rule's feedback channel files for every discovered key-tuple.
+
+    Seeded once (when absent) — notes with a placeholder, select with its default; an
+    existing file is never clobbered, so human edits survive. Deleting a channel file
+    re-seeds it on the next pass.
     """
     known = _known_key_values(project.root, loaded)
     for rule in loaded.rules:
-        if rule.feedback is None or not rule.enabled:
+        if not rule.enabled or not rule.feedback:
             continue
-        pat = Pattern.compile(rule.feedback.append)
-        if any(k not in known for k in pat.keys):
-            continue  # no source for these keys yet
-        value_sets = [sorted(known[k]) for k in pat.keys]
-        for combo in itertools.product(*value_sets):
-            keys = dict(zip(pat.keys, combo))
-            path = project.root / pat.fill(keys)
-            if not path.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(_SEED_PLACEHOLDER)
-                report(f"  seed   {path}")
+        for channel in rule.feedback:
+            pat = Pattern.compile(channel.path)
+            if any(k not in known for k in pat.keys):
+                continue  # no source for these keys yet
+            value_sets = [sorted(known[k]) for k in pat.keys]
+            for combo in itertools.product(*value_sets):
+                keys = dict(zip(pat.keys, combo))
+                path = project.root / pat.fill(keys)
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(_channel_seed(channel))
+                    report(f"  seed   {path}")
 
 
 def _inputs_present(binding: Binding) -> bool:

@@ -163,9 +163,9 @@ def workspace(
 ) -> None:
     """Open the human-in-the-loop feedback workspace for a built pipeline.
 
-    Shows every rendered output whose rule declares a `feedback.append` channel and lets a
-    human attach feedback, which is saved to that output's feedback file and folded back in
-    on the next run.
+    Shows every rendered output whose rule declares one or more `feedback` channels and lets
+    a human record feedback (notes or a selection), which is saved to the channel file and
+    folded back in on the next run.
     """
     project = _project()
     try:
