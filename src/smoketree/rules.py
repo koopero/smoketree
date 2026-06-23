@@ -79,6 +79,12 @@ def _validate(pipeline_id: str, pipeline: Pipeline) -> None:
                 f"{', '.join(sorted(ports)) or '(none)'}."
             )
 
+        if rule.filter is not None and rule.filter.input not in rule.in_:
+            raise ValidationError(
+                f"Rule '{rule.name}': filter.input '{rule.filter.input}' is not a declared "
+                f"input. Inputs: {', '.join(sorted(rule.in_)) or '(none)'}."
+            )
+
         fb_names: set[str] = set()
         for channel in rule.feedback:
             if channel.name in fb_names:

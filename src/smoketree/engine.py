@@ -261,6 +261,40 @@ def _execute(project: Project, binding: Binding, report: Reporter) -> None:
             _validate_port(binding.rule.name, port, path, schema)
 
 
+def _filter_pass(binding: Binding) -> bool:
+    """Whether ``binding`` passes its rule's filter predicate (reads an input data file)."""
+    spec = binding.rule.filter
+    value = binding.inputs.get(spec.input)
+    if not isinstance(value, Path) or not value.is_file():
+        return False
+    data = load_data(value)
+    if spec.field is not None:
+        actual = data.get(spec.field) if isinstance(data, dict) else None
+    else:
+        actual = data
+    return spec.matches(actual)
+
+
+def _drop(binding: Binding, state: State, report: Reporter) -> bool:
+    """Remove a filtered-out binding's managed output(s) and forget its record.
+
+    Returns whether anything was removed on disk (so the caller can re-plan downstream).
+    """
+    removed = False
+    for path in binding.enumerable_outputs:
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            report(f"  drop   {path}")
+            removed = True
+    for owned in binding.owned_prefixes:
+        if owned.is_dir():
+            shutil.rmtree(owned)
+            report(f"  drop   {owned}")
+            removed = True
+    state.discard(binding.identity)
+    return removed
+
+
 def _newest_mtime(path: Path) -> float:
     if path.is_file():
         return path.stat().st_mtime
@@ -316,6 +350,14 @@ def run(
         for binding in bindings:
             if not _inputs_present(binding):
                 continue  # inputs pruned earlier this pass; re-evaluated next pass
+            if binding.rule.filter is not None and not _filter_pass(binding):
+                # Filtered out: keep the managed set in sync by dropping any output this
+                # binding produced before (e.g. an idea un-approved). Removing something
+                # is progress — downstream that globbed it must re-plan.
+                if _drop(binding, state, report):
+                    state.save()
+                    progressed = True
+                continue
             stale, reason = _staleness(binding, state)
             if not stale:
                 continue
@@ -360,6 +402,11 @@ def compute_plan(project: Project, loaded: LoadedPipeline, *, force: bool = Fals
             entries.append(PlanEntry(rule.name, "PENDING", "no inputs yet"))
             continue
         for binding in bindings:
+            if rule.filter is not None and (
+                not _inputs_present(binding) or not _filter_pass(binding)
+            ):
+                entries.append(PlanEntry(binding.identity, "DROP", "filtered out"))
+                continue
             if force:
                 entries.append(PlanEntry(binding.identity, "RUN", "forced"))
                 continue

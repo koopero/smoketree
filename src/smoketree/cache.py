@@ -87,6 +87,10 @@ class State:
         if job is not None:
             job.fingerprint = fingerprint
 
+    def discard(self, identity: str) -> None:
+        """Forget a job's record (e.g. its output was dropped by a filter)."""
+        self.jobs.pop(identity, None)
+
     def clear(self) -> None:
         self.jobs.clear()
 

@@ -551,6 +551,96 @@ def test_set_select_rejects_unknown_value(tmp_path: Path):
         set_select(sel, "bogus")
 
 
+# --------------------------------------------------------------------------- #
+# filter: data-driven selection / gate (projects a managed subset)
+# --------------------------------------------------------------------------- #
+
+
+APPROVE_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: approve\n"
+    '    in:\n      seed: "ideas/{idea}/seed.yaml"\n'
+    '      status: "ideas/{idea}/status.yaml"\n'
+    '    out:\n      sel: "approved/{idea}/seed.yaml"\n'
+    "    filter: { input: status, field: status, equals: approve }\n"
+    '    run: "cp {seed} {sel}"\n'
+)
+
+
+def _ideas(tmp_path: Path, **statuses: str) -> None:
+    for idea, status in statuses.items():
+        write(tmp_path, f"ideas/{idea}/seed.yaml", f"id: {idea}\n")
+        write(tmp_path, f"ideas/{idea}/status.yaml", f"status: {status}\n")
+
+
+def test_filter_projects_only_matching(tmp_path: Path):
+    project = make_project(tmp_path, APPROVE_PIPE)
+    _ideas(tmp_path, alpha="approve", beta="pending")
+    assert run(project) == 1  # only alpha passes
+    assert (tmp_path / "approved/alpha/seed.yaml").exists()
+    assert not (tmp_path / "approved/beta").exists()
+    assert run(project) == 0  # idempotent
+
+
+def test_filter_drops_output_when_unapproved(tmp_path: Path):
+    project = make_project(tmp_path, APPROVE_PIPE)
+    _ideas(tmp_path, alpha="approve")
+    run(project)
+    assert (tmp_path / "approved/alpha/seed.yaml").exists()
+    # un-approve: the managed projection must drop back out of sync
+    write(tmp_path, "ideas/alpha/status.yaml", "status: ignore\n")
+    run(project)
+    assert not (tmp_path / "approved/alpha/seed.yaml").exists()
+    # re-approving brings it back
+    write(tmp_path, "ideas/alpha/status.yaml", "status: approve\n")
+    assert run(project) == 1
+    assert (tmp_path / "approved/alpha/seed.yaml").exists()
+
+
+def test_filter_among(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: keep\n"
+        '    in:\n      seed: "ideas/{idea}/seed.yaml"\n'
+        '      status: "ideas/{idea}/status.yaml"\n'
+        '    out:\n      sel: "kept/{idea}/seed.yaml"\n'
+        "    filter: { input: status, field: status, among: [approve, recycle] }\n"
+        '    run: "cp {seed} {sel}"\n',
+    )
+    _ideas(tmp_path, alpha="approve", beta="recycle", gamma="ignore")
+    run(project)
+    assert (tmp_path / "kept/alpha/seed.yaml").exists()
+    assert (tmp_path / "kept/beta/seed.yaml").exists()
+    assert not (tmp_path / "kept/gamma").exists()
+
+
+def test_filter_unknown_input_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n  - name: r\n"
+        '    in:\n      seed: "ideas/{idea}/seed.yaml"\n'
+        '    out:\n      sel: "out/{idea}.yaml"\n'
+        "    filter: { input: status, equals: approve }\n"
+        '    run: "cp {seed} {sel}"\n',
+    )
+    with pytest.raises(ValidationError, match="not a declared input"):
+        load_pipeline(project, "g")
+
+
+def test_filter_requires_exactly_one_predicate(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n  - name: r\n"
+        '    in:\n      status: "ideas/{idea}/status.yaml"\n'
+        '    out:\n      sel: "out/{idea}.yaml"\n'
+        "    filter: { input: status }\n"  # neither equals nor among
+        '    run: "cp {status} {sel}"\n',
+    )
+    with pytest.raises(SmoketreeError, match="exactly one"):
+        load_pipeline(project, "g")
+
+
 def test_workspace_server_select_and_note(tmp_path: Path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

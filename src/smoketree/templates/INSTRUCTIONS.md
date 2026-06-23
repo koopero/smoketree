@@ -147,6 +147,35 @@ compiles notes into a directive the prompt consumes, closing the loop:
 `feedback:` channel — a notes box or a select control per channel (with its `describe`),
 saving to the channel file.
 
+## Selecting / gating with `filter`
+
+A rule can carry a **`filter`** — a declarative keep/drop predicate over one of its input
+data files. The rule emits its output only for bindings that pass, and **drops** the
+managed output of bindings that fail. So it *projects a selected subset* that downstream
+globs — the data-driven counterpart to the `select` feedback channel above:
+
+```yaml
+- name: approved
+  in:
+    seed:   "brainstorm/ideas/{idea}/seed.yaml"
+    status: "brainstorm/ideas/{idea}/status.yaml"   # written by a `select` channel
+  out:
+    sel: "brainstorm/approved/{idea}/seed.yaml"
+  filter: { input: status, field: status, equals: approve }   # or: among: [approve, recycle]
+  run: "cp {seed} {sel}"        # any backend; cp/ln projects the selection
+```
+
+- `input` names the input port whose data file holds the value; `field` picks a key from
+  it (omit for a bare scalar). Keep when the value `equals` a string **or** is `among` a
+  list — exactly one of the two (no expression language).
+- A passing binding runs normally; a failing one has its output removed and kept out of
+  the set. Flip `status` from `approve` to `ignore` and the next run drops
+  `approved/{idea}/` back out; flip it back and the entry returns.
+
+Downstream rules glob `brainstorm/approved/{idea}/…`, so they only ever see selected
+items. (`recycle` is just its own filtered set — `filter: { …, equals: recycle }` into a
+`recycle/` prefix a regen rule consumes.)
+
 ## CLI
 
 ```

@@ -96,6 +96,36 @@ class FeedbackChannel(BaseModel):
         return self
 
 
+class FilterSpec(BaseModel):
+    """A declarative keep/drop predicate over one of a rule's input data files.
+
+    Reads ``input`` (a data file: YAML/JSON), takes ``field`` from it (or the whole value
+    when ``field`` is omitted), and keeps the binding when that value equals ``equals`` or
+    is among ``among``. A rule with a ``filter`` emits its output only for bindings that
+    pass; a binding that fails has its managed output dropped — so the rule *projects a
+    selected subset* (e.g. ``approved/{idea}/…``) that downstream globs. No expression
+    language: exactly one of ``equals`` / ``among``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: str
+    field: str | None = None
+    equals: str | None = None
+    among: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check(self) -> "FilterSpec":
+        if (self.equals is not None) == bool(self.among):
+            raise ValueError("filter needs exactly one of 'equals' or 'among'.")
+        return self
+
+    def matches(self, value: object) -> bool:
+        if self.equals is not None:
+            return value == self.equals
+        return value in self.among
+
+
 class Rule(BaseModel):
     """One transform: input path-pattern(s) -> output path-pattern(s) + a command.
 
@@ -130,6 +160,9 @@ class Rule(BaseModel):
     # delete managed, key-scoped children under this rule's owned prefix that vanish
     # from the regenerated set (scatter GC). Scoped to the binding.
     prune: bool = False
+    # keep/drop predicate: the rule emits its output only for bindings that pass, and
+    # drops the managed output of bindings that fail (a data-driven selector/gate).
+    filter: FilterSpec | None = None
 
 
 class Pipeline(BaseModel):
