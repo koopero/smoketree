@@ -13,6 +13,7 @@ import httpx
 
 from ..errors import ExecutionError
 from ..images import encode_image
+from ..serde import write_structured
 from ._prompt import render_prompt
 from .base import Backend, ExecutionContext
 
@@ -32,9 +33,12 @@ class OllamaBackend(Backend):
                 f"Rule '{ctx.rule_name}': ollama needs exactly one output "
                 f"(got {len(ctx.outputs)})."
             )
-        target = next(iter(ctx.outputs.values()))
+        output_name, target = next(iter(ctx.outputs.items()))
+        schema = ctx.schemas.get(output_name)
 
         payload = self._build_payload(ctx)
+        if schema is not None:
+            payload["format"] = schema  # constrain output to the port's schema
         base_url = str(ctx.project.config.defaults.ollama_url).rstrip("/")
         try:
             with httpx.Client(base_url=base_url, timeout=_TIMEOUT) as client:
@@ -54,8 +58,11 @@ class OllamaBackend(Backend):
                 f"(done_reason={body.get('done_reason')!r}). Try raising "
                 f"options.num_predict or a different model."
             )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text)
+        if schema is not None:
+            write_structured(text, target)  # JSON response -> YAML/JSON per extension
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
 
     def _build_payload(self, ctx: ExecutionContext) -> dict:
         cfg = ctx.config

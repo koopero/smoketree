@@ -16,6 +16,7 @@ from pathlib import Path
 
 from ..errors import ExecutionError
 from ..images import encode_image
+from ..serde import write_structured
 from ._prompt import render_prompt
 from .base import Backend, ExecutionContext
 
@@ -33,21 +34,27 @@ class ClaudeBackend(Backend):
                 f"Rule '{ctx.rule_name}': claude needs exactly one output "
                 f"(got {len(ctx.outputs)})."
             )
-        target = next(iter(ctx.outputs.values()))
+        output_name, target = next(iter(ctx.outputs.items()))
+        schema = ctx.schemas.get(output_name)
 
         prompt_text, image_blocks = self._build_prompt(ctx)
         content: list[dict] = [{"type": "text", "text": prompt_text}, *image_blocks]
+
+        kwargs: dict = {
+            "model": cfg.get("model", _DEFAULT_MODEL),
+            "max_tokens": cfg.get("max_tokens", _DEFAULT_MAX_TOKENS),
+            "system": self._render_system(ctx),
+            "messages": [{"role": "user", "content": content}],
+        }
+        if schema is not None:
+            # Structured outputs: constrain the response to the port's schema.
+            kwargs["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
 
         from anthropic import Anthropic
 
         client = Anthropic()
         try:
-            message = client.messages.create(
-                model=cfg.get("model", _DEFAULT_MODEL),
-                max_tokens=cfg.get("max_tokens", _DEFAULT_MAX_TOKENS),
-                system=self._render_system(ctx),
-                messages=[{"role": "user", "content": content}],
-            )
+            message = client.messages.create(**kwargs)
         except Exception as exc:  # network/API failures
             raise ExecutionError(f"Claude API call failed: {exc}") from exc
 
@@ -62,8 +69,11 @@ class ClaudeBackend(Backend):
                 f"Claude returned an empty response for rule '{ctx.rule_name}' "
                 f"(stop_reason={message.stop_reason!r}). Try raising max_tokens."
             )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text)
+        if schema is not None:
+            write_structured(text, target)  # JSON response -> YAML/JSON per extension
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
 
     def _render_system(self, ctx: ExecutionContext) -> str:
         system = ctx.config.get("system")

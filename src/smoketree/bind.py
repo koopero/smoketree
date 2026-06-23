@@ -181,6 +181,7 @@ class Binding:
     enumerable_outputs: list[Path]      # concrete (non-scatter) outputs, for staleness
     owned_prefixes: list[Path]          # scatter owned dirs, for prune
     command: str | None                 # rendered shell command (None for non-shell)
+    schemas: dict[str, Path] = field(default_factory=dict)  # port name -> schema file
 
     @property
     def identity(self) -> str:
@@ -240,6 +241,7 @@ def bind_rule(root: Path, rule: Rule) -> list[Binding]:
         command = (
             _render_command(rule, keys, inputs, outputs) if rule.run is not None else None
         )
+        schemas = {port: root / rel for port, rel in rule.schemas.items()}
         bindings.append(
             Binding(
                 rule=rule,
@@ -249,6 +251,7 @@ def bind_rule(root: Path, rule: Rule) -> list[Binding]:
                 enumerable_outputs=enumerable,
                 owned_prefixes=owned,
                 command=command,
+                schemas=schemas,
             )
         )
     return bindings

@@ -66,14 +66,45 @@ cross-product**.
 
 ## Caching & rebuilds
 
-A job is stale (and re-runs) when it has no record, an output is missing, or its inputs or
-command changed. Staleness is content-hashed, so identical content never rebuilds.
+A job is stale (and re-runs) when it has no record, an output is missing, or its inputs,
+command, or **schema** changed. Staleness is content-hashed (gated by a cheap mtime+size
+fingerprint, so big media isn't re-read needlessly); identical content never rebuilds.
 `--force` ignores the cache.
 
 `prune: true` on a scatter rule deletes managed, key-scoped children under its owned prefix
 that vanish from the regenerated set (e.g. an episode re-splitting 7→5 segments removes the
 2 stale ones), scoped to the binding so siblings are untouched. It never deletes authored
 sources.
+
+## Schemas & typed data
+
+A rule can attach a **JSON Schema (authored in YAML)** to any of its ports — the engine
+validates that port's data and, for LLM backends, *constrains* the model's output to it:
+
+```yaml
+- name: cast
+  in:   { brief: "sources/brief.txt" }
+  out:  { cast: "work/cast.yaml" }
+  backend: claude
+  schema:
+    cast: "schema/cast.yaml"      # port name -> schema file (itself YAML)
+  config: { prompt: "Build the ensemble cast for: {brief}" }
+```
+
+- **Constraint** — when a `claude`/`ollama` rule's (single) output port has a schema, the
+  call is constrained to emit JSON matching it. The response is written in the output's
+  format **by extension**: `work/cast.yaml` lands as YAML, not JSON. JSON only ever exists
+  on the wire to the model — every artifact on disk stays YAML (a `.json` port opts into
+  JSON deliberately).
+- **Boundary validation (any backend)** — a schema'd **input** is validated before the rule
+  runs; a schema'd **output** after. A mismatch is a hard error naming the port and the
+  failing field. This catches malformed generations *and* bad hand-edits to data files.
+- **Dependency** — schema files are content-hashed into staleness: edit a schema and the
+  rule re-runs and re-validates. A missing schema file is an error.
+
+Schemas and data files are read format-agnostically (YAML is a superset of JSON, so either
+parses), and a `.yaml` / `.json` / `.csv` output is treated as `data` — its text inlines
+into a downstream `{port}` prompt reference like any other input.
 
 ## Human-in-the-loop feedback
 

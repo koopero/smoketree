@@ -750,3 +750,170 @@ def test_comfyui_backend_runs_via_engine(tmp_path: Path, monkeypatch):
     wf = submitted["workflow"]
     assert wf["6"]["inputs"]["text"] == "a prompt body"  # text input injected
     assert isinstance(wf["3"]["inputs"]["seed"], int)  # deterministic seed injected
+
+
+# --------------------------------------------------------------------------- #
+# schema: boundary validation + LLM output constraint (YAML on disk)
+# --------------------------------------------------------------------------- #
+
+
+SCHEMA_YAML = (
+    "type: object\n"
+    "additionalProperties: false\n"
+    "required: [name]\n"
+    "properties:\n  name: {type: string}\n"
+)
+
+COPY_WITH_SCHEMA = (
+    "name: g\nrules:\n"
+    "  - name: copy\n"
+    '    in:\n      src: "sources/{m}/in.yaml"\n'
+    '    out:\n      data: "work/{m}/out.yaml"\n'
+    '    schema:\n      data: "schema/thing.yaml"\n'
+    '    run: "cp {src} {data}"\n'
+)
+
+
+def test_output_schema_passes_on_valid_data(tmp_path: Path):
+    project = make_project(tmp_path, COPY_WITH_SCHEMA)
+    write(tmp_path, "schema/thing.yaml", SCHEMA_YAML)
+    write(tmp_path, "sources/alpha/in.yaml", "name: zonk\n")
+    assert run(project) == 1
+    assert (tmp_path / "work/alpha/out.yaml").exists()
+
+
+def test_output_schema_hard_fails_on_invalid_data(tmp_path: Path):
+    project = make_project(tmp_path, COPY_WITH_SCHEMA)
+    write(tmp_path, "schema/thing.yaml", SCHEMA_YAML)
+    write(tmp_path, "sources/alpha/in.yaml", "nope: zonk\n")  # missing required 'name'
+    with pytest.raises(ExecutionError, match="schema validation"):
+        run(project)
+
+
+def test_editing_schema_reruns(tmp_path: Path):
+    project = make_project(tmp_path, COPY_WITH_SCHEMA)
+    write(tmp_path, "schema/thing.yaml", SCHEMA_YAML)
+    write(tmp_path, "sources/alpha/in.yaml", "name: zonk\n")
+    run(project)
+    assert run(project) == 0  # idempotent
+    # Editing the schema (still valid for the data) must re-run + re-validate.
+    write(tmp_path, "schema/thing.yaml", SCHEMA_YAML + "  extra: {type: string}\n")
+    assert run(project) == 1
+
+
+def test_schema_unknown_port_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: copy\n"
+        '    in:\n      src: "sources/in.txt"\n'
+        '    out:\n      data: "work/out.txt"\n'
+        '    schema:\n      bogus: "schema/x.yaml"\n'
+        '    run: "cp {src} {data}"\n',
+    )
+    with pytest.raises(ValidationError, match="unknown port"):
+        run(project)
+
+
+def test_ollama_schema_constrains_and_writes_yaml(tmp_path: Path, monkeypatch):
+    import yaml as _yaml
+
+    posted = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": '{"name": "zonk"}'}  # model returns JSON under the schema
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json):
+            posted.update(json)
+            return FakeResp()
+
+    monkeypatch.setattr("smoketree.backends.ollama.httpx.Client", FakeClient)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: prompt\n    backend: ollama\n"
+        '    in:\n      brief: "sources/{m}/brief.txt"\n'
+        '    out:\n      data: "work/{m}/out.yaml"\n'
+        '    schema:\n      data: "schema/thing.yaml"\n'
+        "    config:\n      model: testmodel\n"
+        '      prompt: "name for {brief}"\n',
+    )
+    write(tmp_path, "schema/thing.yaml", SCHEMA_YAML)
+    write(tmp_path, "sources/alpha/brief.txt", "a winged thing\n")
+    run(project)
+
+    # The schema was injected as the Ollama `format` constraint...
+    assert posted["format"]["required"] == ["name"]
+    # ...and the JSON response landed on disk as YAML, not bare JSON.
+    out = (tmp_path / "work/alpha/out.yaml").read_text()
+    assert _yaml.safe_load(out) == {"name": "zonk"}
+    assert "{" not in out
+
+
+def test_claude_schema_constrains_and_writes_yaml(tmp_path: Path, monkeypatch):
+    import sys
+    import types
+
+    import yaml as _yaml
+
+    captured = {}
+
+    class Block:
+        type = "text"
+
+        def __init__(self, text):
+            self.text = text
+
+    class Msg:
+        stop_reason = "end_turn"
+        stop_details = None
+
+        def __init__(self, text):
+            self.content = [Block(text)]
+
+    class FakeMessages:
+        def create(self, **kw):
+            captured.update(kw)
+            return Msg('{"name": "zonk"}')
+
+    class FakeAnthropic:
+        def __init__(self, *a, **k):
+            self.messages = FakeMessages()
+
+    fake = types.ModuleType("anthropic")
+    fake.Anthropic = FakeAnthropic
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: prompt\n    backend: claude\n"
+        '    in:\n      brief: "sources/{m}/brief.txt"\n'
+        '    out:\n      data: "work/{m}/out.yaml"\n'
+        '    schema:\n      data: "schema/thing.yaml"\n'
+        "    config:\n      model: claude-test\n"
+        '      prompt: "name for {brief}"\n',
+    )
+    write(tmp_path, "schema/thing.yaml", SCHEMA_YAML)
+    write(tmp_path, "sources/alpha/brief.txt", "a winged thing\n")
+    run(project)
+
+    fmt = captured["output_config"]["format"]
+    assert fmt["type"] == "json_schema" and fmt["schema"]["required"] == ["name"]
+    out = (tmp_path / "work/alpha/out.yaml").read_text()
+    assert _yaml.safe_load(out) == {"name": "zonk"}

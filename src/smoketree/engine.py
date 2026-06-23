@@ -16,12 +16,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import jsonschema
+
 from .backends import ExecutionContext, get_backend
 from .bind import Binding, Pattern, bind_rule
 from .cache import State, hash_file, hash_text
 from .errors import ExecutionError
+from .loader import load_yaml
 from .project import Project
 from .rules import LoadedPipeline
+from .serde import load_data
 
 _SEED_PLACEHOLDER = "(no feedback yet)\n"
 
@@ -47,6 +51,9 @@ def _input_hash(binding: Binding) -> str:
         paths = value if isinstance(value, list) else [value]
         for path in sorted(paths):
             parts.append(f"{name}:{hash_file(path)}")
+    for port in sorted(binding.schemas):
+        path = binding.schemas[port]
+        parts.append(f"schema:{port}:{hash_file(path) if path.exists() else 'missing'}")
     parts.append(f"transform:{hash_text(binding.transform_fingerprint)}")
     return hash_text("\n".join(parts))
 
@@ -68,6 +75,13 @@ def _input_fingerprint(binding: Binding) -> str:
                 parts.append(f"{name}:{path}:{st.st_mtime_ns}:{st.st_size}")
             except OSError:
                 parts.append(f"{name}:{path}:missing")
+    for port in sorted(binding.schemas):
+        path = binding.schemas[port]
+        try:
+            st = path.stat()
+            parts.append(f"schema:{port}:{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            parts.append(f"schema:{port}:missing")
     parts.append(f"transform:{binding.transform_fingerprint}")
     return hash_text("\n".join(parts))
 
@@ -160,7 +174,44 @@ def _staleness(binding: Binding, state: State) -> tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 
 
+def _load_schemas(binding: Binding) -> dict[str, dict]:
+    """Resolve each declared schema file to a dict (authored YAML -> JSON Schema)."""
+    schemas: dict[str, dict] = {}
+    for port, path in binding.schemas.items():
+        if not path.exists():
+            raise ExecutionError(
+                f"Rule '{binding.rule.name}': schema for port '{port}' not found: {path}."
+            )
+        schemas[port] = load_yaml(path)
+    return schemas
+
+
+def _validate_port(rule_name: str, port: str, path: Path, schema: dict) -> None:
+    """Validate a data file against its port's schema; hard-error on mismatch."""
+    try:
+        jsonschema.validate(load_data(path), schema)
+    except jsonschema.ValidationError as exc:
+        raise ExecutionError(
+            f"Rule '{rule_name}': port '{port}' ({path}) failed schema validation: "
+            f"{exc.message} (at {'/'.join(str(p) for p in exc.absolute_path) or '<root>'})."
+        ) from exc
+    except jsonschema.SchemaError as exc:
+        raise ExecutionError(
+            f"Rule '{rule_name}': schema for port '{port}' is itself invalid: {exc.message}."
+        ) from exc
+
+
 def _execute(project: Project, binding: Binding, report: Reporter) -> None:
+    schemas = _load_schemas(binding)
+
+    # Validate schema'd inputs before running — the contract this rule consumes.
+    for port, schema in schemas.items():
+        value = binding.inputs.get(port)
+        if value is None:
+            continue
+        for path in value if isinstance(value, list) else [value]:
+            _validate_port(binding.rule.name, port, path, schema)
+
     for path in binding.enumerable_outputs:
         path.parent.mkdir(parents=True, exist_ok=True)
     for owned in binding.owned_prefixes:
@@ -174,6 +225,7 @@ def _execute(project: Project, binding: Binding, report: Reporter) -> None:
         outputs=binding.outputs,
         command=binding.command,
         config=binding.rule.config,
+        schemas=schemas,
         seed=int(hash_text(binding.identity), 16) % (2**32),
         env=dict(project.config.env),
     )
@@ -187,6 +239,12 @@ def _execute(project: Project, binding: Binding, report: Reporter) -> None:
             f"declared output(s): {', '.join(str(p) for p in missing)}.\n"
             f"  $ {binding.command}"
         )
+
+    # Validate schema'd outputs after running — the contract this rule produces.
+    for port, schema in schemas.items():
+        path = binding.outputs.get(port)
+        if path is not None and path.is_file():
+            _validate_port(binding.rule.name, port, path, schema)
 
 
 def _newest_mtime(path: Path) -> float:

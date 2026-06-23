@@ -70,6 +70,15 @@ def _validate(pipeline_id: str, pipeline: Pipeline) -> None:
                 f"Rule '{rule.name}': backend 'shell' requires a 'run' command."
             )
 
+        ports = set(rule.in_) | set(rule.out)
+        unknown_ports = set(rule.schemas) - ports
+        if unknown_ports:
+            raise ValidationError(
+                f"Rule '{rule.name}': schema declared for unknown port(s) "
+                f"{', '.join(sorted(unknown_ports))}. Ports: "
+                f"{', '.join(sorted(ports)) or '(none)'}."
+            )
+
         if rule.feedback is not None:
             fb_keys = set(Pattern.compile(rule.feedback.append).keys)
             unknown = fb_keys - (in_keys | out_keys)

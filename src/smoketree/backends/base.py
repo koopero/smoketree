@@ -28,6 +28,9 @@ class ExecutionContext:
     command: str | None = None
     # non-shell backends: the rule's `config` block (model, prompt, params, ...)
     config: dict[str, Any] = field(default_factory=dict)
+    # port name -> resolved JSON Schema dict, for ports that declare one. An LLM backend
+    # uses its output port's schema to constrain generation.
+    schemas: dict[str, dict] = field(default_factory=dict)
     # deterministic per-job seed (from the binding identity)
     seed: int = 0
     env: dict[str, str] = field(default_factory=dict)

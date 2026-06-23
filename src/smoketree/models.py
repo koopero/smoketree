@@ -82,6 +82,10 @@ class Rule(BaseModel):
     enabled: bool = True
     # a human-feedback channel attached to this rule's output (seeded, never clobbered)
     feedback: FeedbackSpec | None = None
+    # port name -> path of a JSON Schema (authored in YAML) the engine validates that
+    # port's data against. An output-port schema also constrains LLM backends. Schema
+    # files are dependencies: editing one re-runs and re-validates the rule.
+    schemas: dict[str, str] = Field(default_factory=dict, alias="schema")
     # shell backend: the command template. Required for backend=shell, ignored otherwise.
     run: str | None = None
     # non-shell backends (ollama, replicate, ...): backend-specific settings — model,
