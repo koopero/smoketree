@@ -1006,6 +1006,30 @@ def test_reconcile_take_generated_and_keep_mine(tmp_path: Path):
     assert rec.find_drift(project, load_pipeline(project, "g")) == []
 
 
+def test_workspace_server_drift_and_reconcile(tmp_path: Path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from smoketree.workspace.server import create_app
+
+    project = _drifted_author_project(tmp_path)
+    write(tmp_path, "work/p/brief.md", "MY one\nline two\nline three\n")
+    write(tmp_path, "src/p.txt", "line one\nline two\nGEN three\n")
+    run(project)
+
+    client = TestClient(create_app(project, "g"))
+    drift = client.get("/api/drift").json()["drift"]
+    assert len(drift) == 1
+    item = drift[0]
+    assert item["id"] == "work/p/brief.md" and item["edited"] is True
+    assert "GEN three" in item["diff"]  # the unified diff shows what the generator changed
+
+    r = client.post("/api/reconcile", json={"id": "work/p/brief.md", "action": "merge"})
+    assert r.status_code == 200
+    assert (tmp_path / "work/p/brief.md").read_text() == "MY one\nline two\nGEN three\n"
+    assert client.get("/api/drift").json()["drift"] == []  # cleared
+
+
 def test_workspace_server_select_and_note(tmp_path: Path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

@@ -10,14 +10,17 @@ select control that saves to the channel file, plus a Run button that re-runs th
 
 from __future__ import annotations
 
+import difflib
 import queue
 import threading
 import webbrowser
 
 from pydantic import BaseModel
 
+from .. import reconcile as reconcilelib
 from ..errors import SmoketreeError
 from ..project import Project
+from ..rules import load_pipeline
 from .index import add_note, build_index, set_select
 
 
@@ -31,6 +34,29 @@ class SelectIn(BaseModel):
     id: str
     channel: str
     value: str
+
+
+class ReconcileIn(BaseModel):
+    id: str
+    action: str  # "merge" | "take-generated" | "keep-mine"
+
+
+def _drift_json(drift, root) -> dict:
+    if drift.is_text:
+        base = drift.base.read_text().splitlines() if drift.base.exists() else []
+        generated = drift.template.read_text().splitlines()
+        diff = "\n".join(
+            difflib.unified_diff(base, generated, "forked", "generated", lineterm="")
+        )
+    else:
+        diff = "(binary file)"
+    return {
+        "id": str(drift.authored.relative_to(root)),
+        "label": drift.label,
+        "edited": drift.copy_edited,
+        "is_text": drift.is_text,
+        "diff": diff[:4000],
+    }
 
 
 def _require_fastapi():
@@ -141,6 +167,28 @@ def create_app(project: Project, pipeline_id: str):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse({"ok": True, "value": value})
+
+    @app.get("/api/drift")
+    def api_drift() -> JSONResponse:
+        try:
+            loaded = load_pipeline(Project(root), pipeline_id)
+            drifts = reconcilelib.find_drift(Project(root), loaded)
+        except SmoketreeError as exc:
+            return JSONResponse({"drift": [], "error": str(exc)})
+        return JSONResponse({"drift": [_drift_json(d, root) for d in drifts]})
+
+    @app.post("/api/reconcile")
+    def post_reconcile(req: ReconcileIn) -> JSONResponse:
+        loaded = load_pipeline(Project(root), pipeline_id)
+        for drift in reconcilelib.find_drift(Project(root), loaded):
+            if str(drift.authored.relative_to(root)) == req.id:
+                _guard_in_project(drift.authored)
+                try:
+                    status = reconcilelib.resolve(drift, req.action)
+                except SmoketreeError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                return JSONResponse({"ok": True, "status": status})
+        raise HTTPException(status_code=404, detail="No such drift.")
 
     @app.post("/api/run")
     def run_pipeline() -> StreamingResponse:
@@ -270,6 +318,23 @@ _PAGE = """\
   button.opt:hover { border-color: #4a4f59; }
   button.opt.active { background: #2f6f4f; color: #eafff2; border-color: #3a8a63; }
   .empty { color: #8b8f98; padding: 24px; }
+  #drift:not(:empty) { margin: 18px 24px 0; border: 1px solid #d8a657;
+                       border-radius: 10px; overflow: hidden; }
+  #drift h2 { margin: 0; padding: 10px 14px; font-size: 13px; background: #2a230f;
+              color: #e7c87a; border-bottom: 1px solid #3a3115; }
+  .drow { padding: 10px 14px; border-bottom: 1px solid #2a2d34; }
+  .drow:last-child { border-bottom: none; }
+  .drow .top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .drow .path { font-weight: 600; }
+  .drow .edited { font-size: 11px; color: #d8a657; }
+  .drow .acts { margin-left: auto; display: flex; gap: 6px; }
+  .drow button { background: #262a33; color: #cdd2db; border: 1px solid #3a3d44;
+                 border-radius: 7px; padding: 5px 10px; cursor: pointer;
+                 font: 600 12px/1 system-ui, sans-serif; }
+  .drow button:hover { border-color: #4a4f59; }
+  .drow pre { margin: 8px 0 0; padding: 8px 10px; background: #0f1115; border-radius: 6px;
+              max-height: 200px; overflow: auto; font: 12px/1.45 ui-monospace, monospace; }
+  .drow .add { color: #7bbf7b; } .drow .del { color: #d98a8a; }
 </style>
 </head>
 <body>
@@ -281,12 +346,55 @@ _PAGE = """\
   <button id="run" type="button">▶ Run pipeline</button>
 </header>
 <pre id="log" hidden></pre>
+<section id="drift"></section>
 <main id="grid"><div class="empty">Loading…</div></main>
 <script>
 const grid = document.getElementById('grid');
 const runBtn = document.getElementById('run');
 const logEl = document.getElementById('log');
+const driftEl = document.getElementById('drift');
 let bust = Date.now();
+
+function colorDiff(diff) {
+  return diff.split('\\n').map(l => {
+    const e = esc(l);
+    if (l.startsWith('+') && !l.startsWith('+++')) return `<span class="add">${e}</span>`;
+    if (l.startsWith('-') && !l.startsWith('---')) return `<span class="del">${e}</span>`;
+    return e;
+  }).join('\\n');
+}
+
+async function renderDrift() {
+  const data = await (await fetch('/api/drift')).json();
+  if (!data.drift || !data.drift.length) { driftEl.innerHTML = ''; return; }
+  let html = `<h2>⚠ ${data.drift.length} authored cop(ies) drifted from their template</h2>`;
+  for (const d of data.drift) {
+    html += `<div class="drow" data-id="${esc(d.id)}">
+      <div class="top">
+        <span class="path">${esc(d.id)}</span>
+        ${d.edited ? '<span class="edited">you edited it</span>' : ''}
+        <span class="acts">
+          ${d.is_text ? '<button data-a="merge" type="button">merge</button>' : ''}
+          <button data-a="take-generated" type="button">take generated</button>
+          <button data-a="keep-mine" type="button">keep mine</button>
+        </span>
+      </div>
+      <pre>${colorDiff(d.diff)}</pre>
+    </div>`;
+  }
+  driftEl.innerHTML = html;
+  driftEl.querySelectorAll('.drow').forEach(row => {
+    const id = row.getAttribute('data-id');
+    row.querySelectorAll('button').forEach(b => b.addEventListener('click', async () => {
+      b.disabled = true;
+      const r = await fetch('/api/reconcile', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id, action: b.getAttribute('data-a')}),
+      });
+      if (r.ok) { await renderDrift(); await render(); } else { b.disabled = false; }
+    }));
+  });
+}
 
 async function preview(card) {
   const url = `${card.artifact_url}&t=${bust}`;
@@ -421,12 +529,14 @@ async function runPipeline() {
   } finally {
     bust = Date.now();
     await render();
+    await renderDrift();
     runBtn.disabled = false; runBtn.textContent = label;
   }
 }
 runBtn.addEventListener('click', runPipeline);
 
 render();
+renderDrift();
 </script>
 </body>
 </html>

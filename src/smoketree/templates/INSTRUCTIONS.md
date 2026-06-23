@@ -227,8 +227,12 @@ absent; that copy is **yours** — never clobbered, and the file downstream cons
 - deleting `brief.md` re-seeds it from the current template (a clean "reset to generated");
 - `purge` removes the template, not your copy.
 
-(Seeing what the template has drifted to since you forked — and merging it back in — is a
-later addition; for now `diff brief.template.md brief.md` shows it.)
+**Reconcile.** When the generator's inputs change, its template moves away from the
+fork-base (the template content when you forked). `smoketree reconcile <id>` lists those
+*drifted* copies; resolve each with `--merge` (3-way merge the generated changes into your
+copy — text, conflict markers on overlap), `--take-generated`, or `--keep-mine`. Each
+clears the drift by advancing the fork-base. The workspace shows drift with a diff and the
+same three buttons.
 
 ## CLI
 
@@ -241,6 +245,8 @@ smoketree run <id> --force    # rebuild everything
 smoketree run <id> -r brainstorm           # only this rule (repeatable)
 smoketree run <id> -w run=r2 -w idea=sunset # only bindings matching these keys
 smoketree status <id>         # last-run state
-smoketree workspace <id>      # human-in-the-loop feedback gallery (needs [workspace] extra)
+smoketree reconcile <id>      # list authored copies whose template drifted
+smoketree reconcile <id> --merge   # 3-way merge generated changes into your copies
+smoketree workspace <id>      # human-in-the-loop feedback + reconcile UI (needs [workspace] extra)
 smoketree purge <id>          # delete managed outputs + state
 ```
