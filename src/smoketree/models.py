@@ -172,6 +172,10 @@ class Rule(BaseModel):
     # which the engine courtesy-copies to the authored `name.ext` once (when absent) — a
     # human-owned copy that is never clobbered and is what downstream consumes.
     author: list[str] = Field(default_factory=list)
+    # enable per-cell re-rolls: a `<primary-output>.roll` counter folds into staleness and
+    # the seed, so bumping it re-runs just that cell with a fresh seed (deliberately
+    # breaking content-addressed caching for a non-deterministic regenerate).
+    reroll: bool = False
 
 
 class Pipeline(BaseModel):

@@ -41,6 +41,10 @@ class ReconcileIn(BaseModel):
     action: str  # "merge" | "take-generated" | "keep-mine"
 
 
+class RerollIn(BaseModel):
+    id: str
+
+
 def _drift_json(drift, root) -> dict:
     if drift.is_text:
         base = drift.base.read_text().splitlines() if drift.base.exists() else []
@@ -89,6 +93,7 @@ def _card_json(card) -> dict:
         "label": card.label,
         "media": card.media,
         "flagged": card.flagged,
+        "reroll": card.reroll,
         "channels": channels,
         "artifact_url": f"/artifact?id={card.id}",
     }
@@ -176,6 +181,20 @@ def create_app(project: Project, pipeline_id: str):
         except SmoketreeError as exc:
             return JSONResponse({"drift": [], "error": str(exc)})
         return JSONResponse({"drift": [_drift_json(d, root) for d in drifts]})
+
+    @app.post("/api/reroll")
+    def post_reroll(req: RerollIn) -> JSONResponse:
+        card = _find_card(req.id)
+        if not card.reroll:
+            raise HTTPException(status_code=400, detail="Output's rule has no reroll: true.")
+        roll = card.output_path.with_name(card.output_path.name + ".roll")
+        _guard_in_project(roll)
+        try:
+            current = int(roll.read_text().strip() or "0") if roll.exists() else 0
+        except ValueError:
+            current = 0
+        roll.write_text(f"{current + 1}\n")
+        return JSONResponse({"ok": True, "roll": current + 1})
 
     @app.post("/api/reconcile")
     def post_reconcile(req: ReconcileIn) -> JSONResponse:
@@ -287,6 +306,12 @@ _PAGE = """\
   .dot { width: 8px; height: 8px; border-radius: 50%; background: #3a3d44;
          flex: none; margin-left: auto; }
   .card.flagged .dot { background: #d8a657; }
+  button.reroll { margin-left: auto; background: #2a2433; color: #d9c7ef;
+                  border: 1px solid #4a3d5f; border-radius: 7px; padding: 4px 9px;
+                  cursor: pointer; font: 600 11px/1 system-ui, sans-serif; }
+  button.reroll:hover { border-color: #6a5a85; }
+  button.reroll:disabled { opacity: 0.6; cursor: default; }
+  .head button.reroll + .dot { margin-left: 8px; }
   .preview { background: #0f1115; min-height: 80px; display: flex;
              align-items: center; justify-content: center; }
   .preview img { max-width: 100%; max-height: 320px; display: block; }
@@ -500,12 +525,22 @@ async function render() {
       <div class="head">
         <span class="node">${esc(card.rule)}</span>
         <span class="label">${esc(card.label)}</span>
+        ${card.reroll ? '<button class="reroll" type="button">🎲 re-roll</button>' : ''}
         <span class="dot"></span>
       </div>
       <div class="preview">${await preview(card)}</div>
       <div class="channels"></div>`;
     const wrap = el.querySelector('.channels');
     for (const ch of card.channels) wrap.appendChild(channelEl(card, ch));
+    const rb = el.querySelector('.reroll');
+    if (rb) rb.addEventListener('click', async () => {
+      rb.disabled = true;
+      await fetch('/api/reroll', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: card.id}),
+      });
+      await runPipeline();  // re-render the bumped cell, then refresh
+    });
     grid.appendChild(el);
   }
 }

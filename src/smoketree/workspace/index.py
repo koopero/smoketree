@@ -50,6 +50,7 @@ class FeedbackCard:
     media: str
     output_path: Path
     channels: list[ChannelView]
+    reroll: bool = False
 
     @property
     def flagged(self) -> bool:
@@ -128,6 +129,7 @@ def build_index(project: Project, pipeline_id: str) -> list[FeedbackCard]:
                     media=infer_media(output_path),
                     output_path=output_path,
                     channels=channels,
+                    reroll=rule.reroll,
                 )
             )
     return cards

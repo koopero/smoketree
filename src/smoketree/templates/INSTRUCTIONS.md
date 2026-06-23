@@ -234,6 +234,34 @@ copy — text, conflict markers on overlap), `--take-generated`, or `--keep-mine
 clears the drift by advancing the fork-base. The workspace shows drift with a diff and the
 same three buttons.
 
+## Re-rolling a generative cell (`reroll`)
+
+Staleness is content-addressed, so re-running a cell with unchanged inputs is a no-op — by
+design. When you want a *fresh take* of one generated cell (the model didn't comply, or a
+seedless model just rolled badly), set `reroll: true`:
+
+```yaml
+- name: portrait
+  in:  { prompt: "work/{m}/prompt.txt" }
+  out: { image: "work/{m}/portrait.png" }
+  backend: replicate
+  reroll: true
+  config: { model: "...", seed_field: seed }
+```
+
+The engine keeps a per-cell counter beside the primary output (`portrait.png.roll`). Its
+value folds into **both** the staleness hash (so bumping it re-runs just that cell) and the
+**seed** (so a seeded backend produces a *different* result, not the same image). Roll `0`
+(the default) reproduces today's seed exactly — nothing changes until you actually re-roll.
+
+- `smoketree reroll <id> -w m=alice` bumps the matched cells and re-renders them.
+- In the workspace, reviewable outputs of a `reroll` rule get a **🎲 re-roll** button.
+- Seedless backends (nano-banana, claude) need no seed — the counter still forces the
+  re-run, and the model's own nondeterminism supplies the variation.
+- Gotcha: a seed pinned outside the `ctx.seed` path (ollama `options.seed`, or a replicate
+  `params` seed with no `seed_field`) wins, so the cell re-runs but reproduces — drive the
+  seed via `seed_field` / `seed_inject` for re-roll to vary it.
+
 ## CLI
 
 ```
@@ -247,6 +275,7 @@ smoketree run <id> -w run=r2 -w idea=sunset # only bindings matching these keys
 smoketree status <id>         # last-run state
 smoketree reconcile <id>      # list authored copies whose template drifted
 smoketree reconcile <id> --merge   # 3-way merge generated changes into your copies
+smoketree reroll <id> -w m=alice   # fresh take of a generative cell (reroll: true rules)
 smoketree workspace <id>      # human-in-the-loop feedback + reconcile UI (needs [workspace] extra)
 smoketree purge <id>          # delete managed outputs + state
 ```

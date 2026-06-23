@@ -1030,6 +1030,115 @@ def test_workspace_server_drift_and_reconcile(tmp_path: Path):
     assert client.get("/api/drift").json()["drift"] == []  # cleared
 
 
+# --------------------------------------------------------------------------- #
+# reroll: per-cell counter folds into staleness + seed (deliberate re-render)
+# --------------------------------------------------------------------------- #
+
+
+REROLL_SHELL_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: r\n    reroll: true\n"
+    '    in:\n      x: "src/{m}.txt"\n'
+    '    out:\n      y: "work/{m}.txt"\n    run: "cp {x} {y}"\n'
+)
+
+
+def test_reroll_counter_forces_rerun(tmp_path: Path):
+    project = make_project(tmp_path, REROLL_SHELL_PIPE)
+    write(tmp_path, "src/p.txt", "hi\n")
+    assert run(project) == 1
+    assert run(project) == 0  # cached
+    # bumping the sidecar counter makes just that cell stale
+    (tmp_path / "work/p.txt.roll").write_text("1\n")
+    assert run(project) == 1
+    assert run(project) == 0  # stable again at the new roll
+
+
+def test_bump_roll_increments(tmp_path: Path):
+    project = make_project(tmp_path, REROLL_SHELL_PIPE)
+    write(tmp_path, "src/p.txt", "hi\n")
+    run(project)
+    loaded = load_pipeline(project, "g")
+    [binding] = [b for r in loaded.rules for b in bind_rule(project.root, r)]
+    assert enginelib.bump_roll(binding) == 1
+    assert enginelib.bump_roll(binding) == 2
+    assert (tmp_path / "work/p.txt.roll").read_text().strip() == "2"
+
+
+def test_reroll_varies_seed_at_roll_one_else_identity(tmp_path: Path, monkeypatch):
+    import smoketree.cache as cachelib
+
+    seeds: list[int] = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "ok"}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json):
+            seeds.append(json["options"]["seed"])
+            return FakeResp()
+
+    monkeypatch.setattr("smoketree.backends.ollama.httpx.Client", FakeClient)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: prompt\n    backend: ollama\n    reroll: true\n"
+        '    in:\n      brief: "sources/{m}/brief.txt"\n'
+        '    out:\n      out: "work/{m}/out.txt"\n'
+        "    config:\n      model: testmodel\n"
+        '      prompt: "p for {m}"\n',
+    )
+    write(tmp_path, "sources/alpha/brief.txt", "x\n")
+    run(project)
+    # roll 0 reproduces the bare-identity seed (no churn for existing renders)
+    assert seeds[0] == int(cachelib.hash_text("prompt(m=alpha)"), 16) % (2**32)
+
+    (tmp_path / "work/alpha/out.txt.roll").write_text("1\n")
+    run(project)
+    assert len(seeds) == 2 and seeds[1] != seeds[0]  # roll 1 -> a fresh seed
+
+
+def test_workspace_server_reroll_bumps(tmp_path: Path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from smoketree.workspace.server import create_app
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: render\n    reroll: true\n"
+        '    in:\n      p: "work/{m}/p.txt"\n'
+        '    out:\n      image: "work/{m}/out.png"\n'
+        '    run: "cp {p} {image}"\n'
+        "    feedback:\n"
+        '      - path: "feedback/{m}/notes.md"\n',
+    )
+    write(tmp_path, "work/a/out.png", "img")  # a completed render on disk
+
+    client = TestClient(create_app(project, "g"))
+    card = client.get("/api/index").json()["cards"][0]
+    assert card["reroll"] is True
+
+    r = client.post("/api/reroll", json={"id": card["id"]})
+    assert r.status_code == 200 and r.json()["roll"] == 1
+    assert (tmp_path / "work/a/out.png.roll").read_text().strip() == "1"
+
+
 def test_workspace_server_select_and_note(tmp_path: Path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

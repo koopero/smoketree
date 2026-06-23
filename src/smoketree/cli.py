@@ -163,6 +163,52 @@ def run(
 
 
 @app.command()
+def reroll(
+    pipeline: str = typer.Argument(..., help="Pipeline to re-roll."),
+    rule: list[str] = typer.Option([], "--rule", "-r", help="Only this rule (repeatable)."),
+    where: list[str] = typer.Option(
+        [], "--where", "-w", help="Only bindings with KEY=VALUE (repeatable)."
+    ),
+) -> None:
+    """Re-roll matched cells: bump each one's counter (a fresh seed) and re-render.
+
+    Only rules with `reroll: true` are eligible. Narrow with --rule / --where, e.g.
+    `smoketree reroll g -w idea=sunset`.
+    """
+    project = _project()
+    only, sel = _targets(rule, where)
+    try:
+        loaded = load_pipeline(project, pipeline)
+    except SmoketreeError as exc:
+        _fail(str(exc))
+        return
+
+    bumped = 0
+    for r in loaded.rules:
+        if not r.reroll or (only is not None and r.name not in only):
+            continue
+        for binding in bind_rule(project.root, r):
+            if sel is not None and not all(binding.keys.get(k) == v for k, v in sel.items()):
+                continue
+            n = enginelib.bump_roll(binding)
+            typer.echo(f"  reroll {binding.identity} -> {n}")
+            bumped += 1
+
+    if not bumped:
+        typer.secho(
+            "Nothing to re-roll (matched no cells of a rule with reroll: true).",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    try:
+        enginelib.run(project, loaded, report=typer.echo)
+    except SmoketreeError as exc:
+        _fail(str(exc))
+        return
+    typer.secho("Re-rolled.", fg=typer.colors.GREEN)
+
+
+@app.command()
 def status(
     pipeline: Optional[str] = typer.Argument(None, help="Pipeline (default: all)."),
 ) -> None:

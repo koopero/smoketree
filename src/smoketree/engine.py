@@ -44,6 +44,38 @@ class PlanEntry:
 # --------------------------------------------------------------------------- #
 
 
+def _roll_path(binding: Binding) -> Path | None:
+    """The re-roll counter sidecar beside a reroll rule's primary output (or None)."""
+    if not binding.rule.reroll or not binding.outputs:
+        return None
+    primary = next(iter(binding.outputs.values()))
+    return primary.with_name(primary.name + ".roll")
+
+
+def _roll_value(binding: Binding) -> int:
+    """Current re-roll count for a binding (0 when unset — equivalent to no re-roll)."""
+    path = _roll_path(binding)
+    if path is None or not path.exists():
+        return 0
+    try:
+        return int(path.read_text().strip() or "0")
+    except ValueError:
+        return 0
+
+
+def bump_roll(binding: Binding) -> int:
+    """Increment a binding's re-roll counter — re-renders that cell with a fresh seed."""
+    path = _roll_path(binding)
+    if path is None:
+        raise ExecutionError(
+            f"Rule '{binding.rule.name}' is not a re-roll rule (set reroll: true)."
+        )
+    n = _roll_value(binding) + 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{n}\n")
+    return n
+
+
 def _input_hash(binding: Binding) -> str:
     parts: list[str] = []
     for name in sorted(binding.inputs):
@@ -54,6 +86,8 @@ def _input_hash(binding: Binding) -> str:
     for port in sorted(binding.schemas):
         path = binding.schemas[port]
         parts.append(f"schema:{port}:{hash_file(path) if path.exists() else 'missing'}")
+    if binding.rule.reroll:
+        parts.append(f"roll:{_roll_value(binding)}")
     parts.append(f"transform:{hash_text(binding.transform_fingerprint)}")
     return hash_text("\n".join(parts))
 
@@ -82,6 +116,8 @@ def _input_fingerprint(binding: Binding) -> str:
             parts.append(f"schema:{port}:{st.st_mtime_ns}:{st.st_size}")
         except OSError:
             parts.append(f"schema:{port}:missing")
+    if binding.rule.reroll:
+        parts.append(f"roll:{_roll_value(binding)}")
     parts.append(f"transform:{binding.transform_fingerprint}")
     return hash_text("\n".join(parts))
 
@@ -266,6 +302,11 @@ def _execute(project: Project, binding: Binding, report: Reporter) -> None:
     for owned in binding.owned_prefixes:
         owned.mkdir(parents=True, exist_ok=True)
 
+    # Re-roll folds into the seed: roll 0 reproduces the bare-identity seed (no churn),
+    # roll N gives a fresh but still-deterministic seed. Inert for seedless backends.
+    roll = _roll_value(binding)
+    seed_basis = binding.identity if roll == 0 else f"{binding.identity}#{roll}"
+
     ctx = ExecutionContext(
         project=project,
         rule_name=binding.rule.name,
@@ -276,7 +317,7 @@ def _execute(project: Project, binding: Binding, report: Reporter) -> None:
         config=binding.rule.config,
         schemas=schemas,
         context=binding.context,
-        seed=int(hash_text(binding.identity), 16) % (2**32),
+        seed=int(hash_text(seed_basis), 16) % (2**32),
         env=dict(project.config.env),
     )
     backend = get_backend(binding.rule.backend)
