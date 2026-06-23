@@ -35,6 +35,18 @@ def _project() -> Project:
         raise  # unreachable
 
 
+def _targets(rule: list[str], where: list[str]) -> tuple[set[str] | None, dict[str, str] | None]:
+    """Parse --rule / --where selectors into engine arguments."""
+    only = set(rule) or None
+    pairs: dict[str, str] = {}
+    for item in where:
+        if "=" not in item:
+            _fail(f"--where must be KEY=VALUE, got '{item}'.")
+        key, _, value = item.partition("=")
+        pairs[key.strip()] = value.strip()
+    return only, (pairs or None)
+
+
 # --------------------------------------------------------------------------- #
 
 
@@ -102,12 +114,17 @@ def validate(
 def plan(
     pipeline: str = typer.Argument(..., help="Pipeline to plan."),
     force: bool = typer.Option(False, "--force", help="Treat all jobs as rebuilding."),
+    rule: list[str] = typer.Option([], "--rule", "-r", help="Only this rule (repeatable)."),
+    where: list[str] = typer.Option(
+        [], "--where", "-w", help="Only bindings with KEY=VALUE (repeatable)."
+    ),
 ) -> None:
     """Show the current execution plan (single-pass dry run)."""
     project = _project()
+    only, sel = _targets(rule, where)
     try:
         loaded = load_pipeline(project, pipeline)
-        entries = enginelib.compute_plan(project, loaded, force=force)
+        entries = enginelib.compute_plan(project, loaded, force=force, only=only, where=sel)
     except SmoketreeError as exc:
         _fail(str(exc))
         return
@@ -115,6 +132,7 @@ def plan(
         colour = {
             "SKIP": typer.colors.BRIGHT_BLACK,
             "OFF": typer.colors.BRIGHT_BLACK,
+            "DROP": typer.colors.BRIGHT_BLACK,
             "RUN": typer.colors.YELLOW,
             "PENDING": typer.colors.RED,
         }.get(entry.action)
@@ -125,12 +143,19 @@ def plan(
 def run(
     pipeline: str = typer.Argument(..., help="Pipeline to run."),
     force: bool = typer.Option(False, "--force", help="Ignore cache; re-run all jobs."),
+    rule: list[str] = typer.Option([], "--rule", "-r", help="Only this rule (repeatable)."),
+    where: list[str] = typer.Option(
+        [], "--where", "-w", help="Only bindings with KEY=VALUE (repeatable)."
+    ),
 ) -> None:
-    """Run a pipeline to fixpoint."""
+    """Run a pipeline to fixpoint (optionally narrowed to --rule / --where)."""
     project = _project()
+    only, sel = _targets(rule, where)
     try:
         loaded = load_pipeline(project, pipeline)
-        executed = enginelib.run(project, loaded, force=force, report=typer.echo)
+        executed = enginelib.run(
+            project, loaded, force=force, only=only, where=sel, report=typer.echo
+        )
     except SmoketreeError as exc:
         _fail(str(exc))
         return

@@ -776,6 +776,66 @@ def test_brainstorm_ignore_loop_no_cycle(tmp_path: Path):
     assert (tmp_path / "ideas/sunset/seed.yaml").exists()  # prior ideas preserved
 
 
+# --------------------------------------------------------------------------- #
+# CLI path targeting: run/plan a subset (--rule / --where)
+# --------------------------------------------------------------------------- #
+
+
+TARGET_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: a\n"
+    '    in:\n      x: "src/{m}.txt"\n'
+    '    out:\n      y: "work/a/{m}.txt"\n    run: "cp {x} {y}"\n'
+    "  - name: b\n"
+    '    in:\n      x: "src/{m}.txt"\n'
+    '    out:\n      y: "work/b/{m}.txt"\n    run: "cp {x} {y}"\n'
+)
+
+
+def _target_project(tmp_path: Path) -> Project:
+    project = make_project(tmp_path, TARGET_PIPE)
+    write(tmp_path, "src/p.txt")
+    write(tmp_path, "src/q.txt")
+    return project
+
+
+def test_run_only_rule(tmp_path: Path):
+    project = _target_project(tmp_path)
+    n = enginelib.run(project, load_pipeline(project, "g"), only={"a"})
+    assert n == 2  # a(p), a(q)
+    assert (tmp_path / "work/a/p.txt").exists() and (tmp_path / "work/a/q.txt").exists()
+    assert not (tmp_path / "work/b").exists()  # rule b never ran
+
+
+def test_run_where_key(tmp_path: Path):
+    project = _target_project(tmp_path)
+    n = enginelib.run(project, load_pipeline(project, "g"), where={"m": "p"})
+    assert n == 2  # a(p), b(p)
+    assert (tmp_path / "work/a/p.txt").exists()
+    assert not (tmp_path / "work/a/q.txt").exists()  # q filtered out
+
+
+def test_run_only_rule_and_where(tmp_path: Path):
+    project = _target_project(tmp_path)
+    n = enginelib.run(project, load_pipeline(project, "g"), only={"a"}, where={"m": "p"})
+    assert n == 1  # just a(p)
+    assert (tmp_path / "work/a/p.txt").exists()
+    assert not (tmp_path / "work/a/q.txt").exists()
+    assert not (tmp_path / "work/b").exists()
+
+
+def test_run_unknown_rule_errors(tmp_path: Path):
+    project = _target_project(tmp_path)
+    with pytest.raises(ExecutionError, match="No such rule"):
+        enginelib.run(project, load_pipeline(project, "g"), only={"zzz"})
+
+
+def test_plan_respects_only(tmp_path: Path):
+    project = _target_project(tmp_path)
+    entries = enginelib.compute_plan(project, load_pipeline(project, "g"), only={"a"})
+    assert entries and all(e.identity.startswith("a") for e in entries)
+
+
 def test_workspace_server_select_and_note(tmp_path: Path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

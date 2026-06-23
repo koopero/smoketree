@@ -211,6 +211,8 @@ smoketree validate <id>       # parse + show inferred order
 smoketree plan <id>           # dry run: what would build now
 smoketree run <id>            # run to fixpoint
 smoketree run <id> --force    # rebuild everything
+smoketree run <id> -r brainstorm           # only this rule (repeatable)
+smoketree run <id> -w run=r2 -w idea=sunset # only bindings matching these keys
 smoketree status <id>         # last-run state
 smoketree workspace <id>      # human-in-the-loop feedback gallery (needs [workspace] extra)
 smoketree purge <id>          # delete managed outputs + state

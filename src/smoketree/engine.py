@@ -325,14 +325,35 @@ def _prune(binding: Binding, run_start: float, report: Reporter) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _check_only(loaded: LoadedPipeline, only: set[str] | None) -> None:
+    if only is not None:
+        unknown = only - {r.name for r in loaded.rules}
+        if unknown:
+            raise ExecutionError(
+                f"No such rule(s) in '{loaded.id}': {', '.join(sorted(unknown))}. "
+                f"Rules: {', '.join(r.name for r in loaded.rules)}."
+            )
+
+
+def _where_match(binding: Binding, where: dict[str, str] | None) -> bool:
+    return where is None or all(binding.keys.get(k) == v for k, v in where.items())
+
+
 def run(
     project: Project,
     loaded: LoadedPipeline,
     *,
     force: bool = False,
+    only: set[str] | None = None,
+    where: dict[str, str] | None = None,
     report: Reporter = lambda _: None,
 ) -> int:
-    """Run the pipeline to fixpoint. Returns the number of jobs executed."""
+    """Run the pipeline to fixpoint. Returns the number of jobs executed.
+
+    ``only`` restricts to the named rules; ``where`` restricts to bindings whose keys
+    match every ``key=value`` (a binding lacking a named key is excluded).
+    """
+    _check_only(loaded, only)
     state = State.load(project, loaded.id)
     if force:
         state.clear()
@@ -344,8 +365,9 @@ def run(
         bindings = [
             b
             for rule in loaded.rules
-            if rule.enabled
+            if rule.enabled and (only is None or rule.name in only)
             for b in bind_rule(project.root, rule)
+            if _where_match(b, where)
         ]
         progressed = False
         for binding in bindings:
@@ -390,15 +412,25 @@ def run(
     return executed
 
 
-def compute_plan(project: Project, loaded: LoadedPipeline, *, force: bool = False) -> list[PlanEntry]:
+def compute_plan(
+    project: Project,
+    loaded: LoadedPipeline,
+    *,
+    force: bool = False,
+    only: set[str] | None = None,
+    where: dict[str, str] | None = None,
+) -> list[PlanEntry]:
     """A single-pass dry run: current runnable bindings + rules still waiting on inputs."""
+    _check_only(loaded, only)
     state = State.load(project, loaded.id)
     entries: list[PlanEntry] = []
     for rule in loaded.rules:
+        if only is not None and rule.name not in only:
+            continue
         if not rule.enabled:
             entries.append(PlanEntry(rule.name, "OFF", "disabled"))
             continue
-        bindings = bind_rule(project.root, rule)
+        bindings = [b for b in bind_rule(project.root, rule) if _where_match(b, where)]
         if not bindings:
             entries.append(PlanEntry(rule.name, "PENDING", "no inputs yet"))
             continue
