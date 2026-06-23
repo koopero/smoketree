@@ -66,7 +66,8 @@ class OllamaBackend(Backend):
 
     def _build_payload(self, ctx: ExecutionContext) -> dict:
         cfg = ctx.config
-        prompt, image_paths = render_prompt(cfg["prompt"], ctx.inputs, ctx.keys)
+        prompt_inputs = {**ctx.inputs, **ctx.context}
+        prompt, image_paths = render_prompt(cfg["prompt"], prompt_inputs, ctx.keys)
 
         options = dict(cfg.get("options", {}))
         options.setdefault("seed", ctx.seed)
@@ -78,7 +79,7 @@ class OllamaBackend(Backend):
             "options": options,
         }
         if cfg.get("system"):
-            system, _ = render_prompt(cfg["system"], ctx.inputs, ctx.keys)
+            system, _ = render_prompt(cfg["system"], prompt_inputs, ctx.keys)
             payload["system"] = system
         if cfg.get("think") is not None:
             payload["think"] = cfg["think"]

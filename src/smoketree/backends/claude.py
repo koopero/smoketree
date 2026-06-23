@@ -79,11 +79,13 @@ class ClaudeBackend(Backend):
         system = ctx.config.get("system")
         if not system:
             return ""
-        rendered, _ = render_prompt(system, ctx.inputs, ctx.keys)
+        rendered, _ = render_prompt(system, {**ctx.inputs, **ctx.context}, ctx.keys)
         return rendered
 
     def _build_prompt(self, ctx: ExecutionContext) -> tuple[str, list[dict]]:
-        prompt, image_paths = render_prompt(ctx.config["prompt"], ctx.inputs, ctx.keys)
+        prompt, image_paths = render_prompt(
+            ctx.config["prompt"], {**ctx.inputs, **ctx.context}, ctx.keys
+        )
         max_edge = ctx.config.get("image_max_edge", ctx.project.config.defaults.image_max_edge)
         return prompt, [self._image_block(p, max_edge) for p in image_paths]
 

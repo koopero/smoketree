@@ -31,6 +31,9 @@ class ExecutionContext:
     # port name -> resolved JSON Schema dict, for ports that declare one. An LLM backend
     # uses its output port's schema to constrain generation.
     schemas: dict[str, dict] = field(default_factory=dict)
+    # ambient context inputs (name -> path list): exposed to prompts like inputs, but the
+    # engine excluded them from staleness — they inform the transform without gating it.
+    context: "dict[str, list[Path]]" = field(default_factory=dict)
     # deterministic per-job seed (from the binding identity)
     seed: int = 0
     env: dict[str, str] = field(default_factory=dict)

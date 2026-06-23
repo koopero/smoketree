@@ -182,6 +182,11 @@ class Binding:
     owned_prefixes: list[Path]          # scatter owned dirs, for prune
     command: str | None                 # rendered shell command (None for non-shell)
     schemas: dict[str, Path] = field(default_factory=dict)  # port name -> schema file
+    # ambient context inputs (excluded from staleness/present-gate): name -> path list
+    context: dict[str, list[Path]] = field(default_factory=dict)
+    # the staleness basis for the transform — like `command`, but with context blanked,
+    # so a changed context input never restales (set by bind_rule)
+    transform_key: str = ""
 
     @property
     def identity(self) -> str:
@@ -195,17 +200,33 @@ class Binding:
 
     @property
     def transform_fingerprint(self) -> str:
-        """The transform text that gates staleness: the rendered command (shell) or the
-        backend + its (unsubstituted) config block (ollama/replicate/...)."""
-        if self.command is not None:
-            return self.command
-        return f"{self.rule.backend}:" + json.dumps(self.rule.config, sort_keys=True)
+        """The transform text that gates staleness — the rendered command with context
+        blanked (shell) or the backend + its config block (ollama/replicate/...). Context
+        inputs are deliberately excluded so reading them never restales the binding."""
+        return self.transform_key
+
+
+def _resolve_context(root: Path, keys: dict[str, str], patterns: dict[str, Pattern]) -> dict[str, list[Path]]:
+    """Resolve context patterns for one binding — always a (possibly empty) path list.
+
+    Context never gates: rows are filtered to those consistent with the binding's bound
+    keys (a pattern with no shared keys, e.g. a plain ``*`` glob, yields the global set).
+    """
+    resolved: dict[str, list[Path]] = {}
+    for name, pat in patterns.items():
+        paths: list[Path] = []
+        for row in _match_input(root, pat):
+            if all(keys.get(k) == v for k, v in row.keys.items()):
+                paths.extend(row.paths)
+        resolved[name] = sorted(set(paths))
+    return resolved
 
 
 def bind_rule(root: Path, rule: Rule) -> list[Binding]:
     """Enumerate every runnable binding of ``rule`` against the tree under ``root``."""
     in_patterns = {name: Pattern.compile(p) for name, p in rule.in_.items()}
     out_patterns = {name: Pattern.compile(p) for name, p in rule.out.items()}
+    ctx_patterns = {name: Pattern.compile(p) for name, p in rule.context.items()}
     list_inputs = {name for name, pat in in_patterns.items() if pat.has_glob}
     bound_keys = {k for pat in in_patterns.values() for k in pat.keys}
 
@@ -238,9 +259,16 @@ def bind_rule(root: Path, rule: Rule) -> list[Binding]:
                 outputs[name] = path
                 enumerable.append(path)
 
-        command = (
-            _render_command(rule, keys, inputs, outputs) if rule.run is not None else None
-        )
+        context = _resolve_context(root, keys, ctx_patterns)
+        if rule.run is not None:
+            command = _render_command(rule, keys, inputs, outputs, context)
+            # Fingerprint with context blanked: a changed context input must not restale.
+            transform_key = _render_command(
+                rule, keys, inputs, outputs, {name: [] for name in ctx_patterns}
+            )
+        else:
+            command = None
+            transform_key = f"{rule.backend}:" + json.dumps(rule.config, sort_keys=True)
         schemas = {port: root / rel for port, rel in rule.schemas.items()}
         bindings.append(
             Binding(
@@ -252,6 +280,8 @@ def bind_rule(root: Path, rule: Rule) -> list[Binding]:
                 owned_prefixes=owned,
                 command=command,
                 schemas=schemas,
+                context=context,
+                transform_key=transform_key,
             )
         )
     return bindings
@@ -277,10 +307,13 @@ def _render_command(
     keys: dict[str, str],
     inputs: "dict[str, Path | list[Path]]",
     outputs: dict[str, Path],
+    ctx_inputs: "dict[str, list[Path]] | None" = None,
 ) -> str:
     context: dict[str, str] = dict(keys)
     for name, value in inputs.items():
         paths = value if isinstance(value, list) else [value]
+        context[name] = " ".join(str(p) for p in paths)
+    for name, paths in (ctx_inputs or {}).items():
         context[name] = " ".join(str(p) for p in paths)
     for name, path in outputs.items():
         context[name] = str(path)

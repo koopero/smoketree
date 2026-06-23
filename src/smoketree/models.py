@@ -141,6 +141,11 @@ class Rule(BaseModel):
     name: str
     in_: dict[str, str] = Field(default_factory=dict, alias="in")
     out: dict[str, str] = Field(default_factory=dict)
+    # read-only ambient inputs: globbed and exposed to prompts/commands as {name}, but
+    # EXCLUDED from staleness, the inputs-present gate, and dependency inference. Lets a
+    # generator consider existing artifacts (an ignore list) without depending on them —
+    # the way to read your own output without a fixpoint cycle.
+    context: dict[str, str] = Field(default_factory=dict)
     backend: str = "shell"
     # set false to turn a rule (a whole stage) off without deleting it: it never binds,
     # runs, seeds its feedback, or surfaces in the workspace. Flip back to re-enable.

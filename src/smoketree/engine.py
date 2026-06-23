@@ -240,6 +240,7 @@ def _execute(project: Project, binding: Binding, report: Reporter) -> None:
         command=binding.command,
         config=binding.rule.config,
         schemas=schemas,
+        context=binding.context,
         seed=int(hash_text(binding.identity), 16) % (2**32),
         env=dict(project.config.env),
     )

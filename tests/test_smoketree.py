@@ -641,6 +641,141 @@ def test_filter_requires_exactly_one_predicate(tmp_path: Path):
         load_pipeline(project, "g")
 
 
+# --------------------------------------------------------------------------- #
+# context: ambient inputs excluded from staleness (read your output, no cycle)
+# --------------------------------------------------------------------------- #
+
+
+def _run_log(project: Project):
+    lines: list[str] = []
+    n = enginelib.run(project, load_pipeline(project, "g"), report=lines.append)
+    return n, lines
+
+
+CONTEXT_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: cat\n"
+    '    in:\n      brief: "brief.txt"\n'
+    '    context:\n      extra: "extra.txt"\n'
+    '    out:\n      o: "out.txt"\n'
+    '    run: "cat {brief} {extra} > {o}"\n'
+)
+
+
+def test_context_feeds_command_but_not_staleness(tmp_path: Path):
+    project = make_project(tmp_path, CONTEXT_PIPE)
+    write(tmp_path, "brief.txt", "BRIEF\n")
+    write(tmp_path, "extra.txt", "EXTRA1\n")
+    assert run(project) == 1
+    assert (tmp_path / "out.txt").read_text() == "BRIEF\nEXTRA1\n"  # context was used
+
+    # Editing the context input does NOT re-trigger the rule (excluded from staleness).
+    write(tmp_path, "extra.txt", "EXTRA2\n")
+    assert run(project) == 0
+    assert (tmp_path / "out.txt").read_text() == "BRIEF\nEXTRA1\n"  # stale, by design
+
+    # Editing a real input does — and it picks up the current context at run time.
+    write(tmp_path, "brief.txt", "BRIEF2\n")
+    assert run(project) == 1
+    assert (tmp_path / "out.txt").read_text() == "BRIEF2\nEXTRA2\n"
+
+
+def test_context_absent_does_not_gate(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n  - name: cat\n"
+        '    in:\n      brief: "brief.txt"\n'
+        '    context:\n      extra: "nothing/*.txt"\n'  # matches nothing
+        '    out:\n      o: "out.txt"\n'
+        '    run: "cat {brief} {extra} > {o}"\n',
+    )
+    write(tmp_path, "brief.txt", "BRIEF\n")
+    assert run(project) == 1  # missing context doesn't block the rule
+    assert (tmp_path / "out.txt").read_text() == "BRIEF\n"
+
+
+def test_context_name_collision_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n  - name: r\n"
+        '    in:\n      x: "a.txt"\n'
+        '    context:\n      x: "b.txt"\n'  # collides with input name
+        '    out:\n      o: "o.txt"\n    run: "cp {x} {o}"\n',
+    )
+    with pytest.raises(ValidationError, match="collide"):
+        load_pipeline(project, "g")
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end: brainstorm loop — ignore list to the "LLM", no fixpoint cycle
+# --------------------------------------------------------------------------- #
+
+
+BRAINSTORM_PY = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "ideas_dir = Path(sys.argv[1])\n"
+    "ignored = set()\n"
+    "for f in sys.argv[2:]:\n"
+    "    for line in Path(f).read_text().splitlines():\n"
+    "        if line.startswith('lede:'):\n"
+    "            ignored.add(line.split(':', 1)[1].strip())\n"
+    "POOL = ['sunset', 'ocean', 'forest', 'desert']\n"
+    "for w in [w for w in POOL if w not in ignored][:2]:\n"
+    "    d = ideas_dir / w\n"
+    "    d.mkdir(parents=True, exist_ok=True)\n"
+    "    (d / 'seed.yaml').write_text(f'id: {w}\\nlede: {w}\\n')\n"
+)
+
+BRAINSTORM_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: brainstorm\n"
+    '    in:\n      brief: "runs/{run}/go.txt"\n'
+    '    context:\n      ignore: "done/*/lede.yaml"\n'
+    '    out:\n      idea: "ideas/{idea}/seed.yaml"\n'
+    '    run: "python scripts/brainstorm.py {idea} {ignore}"\n'
+    "  - name: mark\n"
+    '    in:\n      seed: "ideas/{idea}/seed.yaml"\n'
+    '      status: "ideas/{idea}/status.yaml"\n'
+    '    out:\n      lede: "done/{idea}/lede.yaml"\n'
+    "    filter: { input: status, field: status, among: [approve, ignore] }\n"
+    '    run: "cp {seed} {lede}"\n'
+)
+
+
+def test_brainstorm_ignore_loop_no_cycle(tmp_path: Path):
+    project = make_project(tmp_path, BRAINSTORM_PIPE)
+    write(tmp_path, "scripts/brainstorm.py", BRAINSTORM_PY)
+
+    # Run 1: no ignore list yet -> first two pool ideas.
+    write(tmp_path, "runs/r1/go.txt", "make ideas\n")
+    n, _ = _run_log(project)
+    assert n == 1  # brainstorm(run=r1); convergence, no max-iter error
+    assert (tmp_path / "ideas/sunset/seed.yaml").exists()
+    assert (tmp_path / "ideas/ocean/seed.yaml").exists()
+
+    # Re-running with no new trigger does nothing — ideas growing did NOT restale
+    # brainstorm (its ignore list is a context input, excluded from staleness).
+    assert run(project) == 0
+
+    # Mark 'sunset' done (a select-channel status would write this); the filter projects
+    # it into done/, which becomes the ignore list.
+    write(tmp_path, "ideas/sunset/status.yaml", "status: approve\n")
+    n, log = _run_log(project)
+    assert n == 1  # only mark(sunset) ran...
+    assert not any("brainstorm(" in line for line in log)  # ...brainstorm stayed put
+    assert (tmp_path / "done/sunset/lede.yaml").exists()
+
+    # Run 2: a new run marker re-triggers brainstorm, which now sees sunset in the ignore
+    # list and skips it — emitting the next unseen idea instead.
+    write(tmp_path, "runs/r2/go.txt", "more ideas\n")
+    n, log = _run_log(project)
+    assert any("brainstorm(run=r2)" in line for line in log)
+    assert not any("brainstorm(run=r1)" in line for line in log)  # r1 not re-run
+    assert (tmp_path / "ideas/forest/seed.yaml").exists()  # a new idea, not sunset
+    assert (tmp_path / "ideas/sunset/seed.yaml").exists()  # prior ideas preserved
+
+
 def test_workspace_server_select_and_note(tmp_path: Path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

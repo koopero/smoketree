@@ -176,6 +176,33 @@ Downstream rules glob `brainstorm/approved/{idea}/…`, so they only ever see se
 items. (`recycle` is just its own filtered set — `filter: { …, equals: recycle }` into a
 `recycle/` prefix a regen rule consumes.)
 
+## Reading your own output without a cycle (`context`)
+
+A generator that should *consider* existing artifacts — an ignore list, prior results —
+but not depend on them needs `context`. Context inputs are globbed and exposed to prompts
+and commands as `{name}`, but are **excluded from staleness, the inputs-present gate, and
+dependency inference**. So producing more output never re-triggers the rule:
+
+```yaml
+- name: brainstorm
+  in:      { brief: "brainstorm/runs/{run}/go.yaml" }   # a marker = a deliberate trigger
+  context: { ignore: "brainstorm/done/*/lede.yaml" }     # read, but doesn't gate
+  out:     { idea: "brainstorm/ideas/{idea}/seed.yaml" } # scatter (no prune; accumulate)
+  backend: claude
+  config:
+    prompt: |
+      {brief}
+      Do NOT repeat these existing ideas:
+      {ignore}
+```
+
+If `ignore` were an ordinary `in:`, this would be a self-feeding rule — each new idea
+grows the glob, restales `brainstorm`, and the max-iteration breaker fires. As `context`
+it doesn't gate, so `brainstorm`'s only staleness driver is its `{run}` marker (and the
+prompt). "Brainstorm again" = drop a new `runs/{run}/` marker; each marker runs it once,
+appending to the flat `ideas/` pool. Pair it with a `filter` that projects the
+"already handled" set into `done/` (excluding `recycle`, so recycled ideas regenerate).
+
 ## CLI
 
 ```

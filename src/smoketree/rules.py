@@ -85,6 +85,21 @@ def _validate(pipeline_id: str, pipeline: Pipeline) -> None:
                 f"input. Inputs: {', '.join(sorted(rule.in_)) or '(none)'}."
             )
 
+        ctx_collisions = set(rule.context) & (set(rule.in_) | set(rule.out))
+        if ctx_collisions:
+            raise ValidationError(
+                f"Rule '{rule.name}': context name(s) {', '.join(sorted(ctx_collisions))} "
+                f"collide with an input/output name."
+            )
+        for name, pat in rule.context.items():
+            unknown = set(Pattern.compile(pat).keys) - (in_keys | out_keys)
+            if unknown:
+                raise ValidationError(
+                    f"Rule '{rule.name}': context '{name}' uses key(s) "
+                    f"{', '.join(sorted(unknown))} the rule doesn't bind (use a glob, or a "
+                    f"key bound by an input/output)."
+                )
+
         fb_names: set[str] = set()
         for channel in rule.feedback:
             if channel.name in fb_names:
@@ -100,9 +115,12 @@ def _validate(pipeline_id: str, pipeline: Pipeline) -> None:
                     f"Keys available: {', '.join(sorted(in_keys | out_keys)) or '(none)'}."
                 )
 
-        # `run` may reference input names, output names, and any bound key. Output keys
+        # `run` may reference input/output/context names and any bound key. Output keys
         # not bound by an input are scatter axes (resolved to an owned dir, not a value).
-        bound_vars = set(rule.in_) | set(rule.out) | in_keys | (out_keys - in_keys)
+        bound_vars = (
+            set(rule.in_) | set(rule.out) | set(rule.context)
+            | in_keys | (out_keys - in_keys)
+        )
         if rule.run is not None:
             for m in _VAR.finditer(rule.run):
                 var = m.group(1)
