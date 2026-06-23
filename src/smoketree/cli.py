@@ -211,6 +211,67 @@ def workspace(
 
 
 @app.command()
+def reconcile(
+    pipeline: str = typer.Argument(..., help="Pipeline."),
+    merge: bool = typer.Option(False, "--merge", help="3-way merge generated into your copy."),
+    take_generated: bool = typer.Option(
+        False, "--take-generated", help="Replace your copy with the generated template."
+    ),
+    keep_mine: bool = typer.Option(False, "--keep-mine", help="Keep your copy; dismiss drift."),
+    rule: list[str] = typer.Option([], "--rule", "-r", help="Only this rule (repeatable)."),
+    where: list[str] = typer.Option(
+        [], "--where", "-w", help="Only bindings with KEY=VALUE (repeatable)."
+    ),
+) -> None:
+    """Show (or resolve) authored copies whose generated template has drifted.
+
+    With no action flag, lists the drift. Pass exactly one of --merge / --take-generated /
+    --keep-mine to resolve every drifted copy (optionally narrowed by --rule / --where).
+    """
+    project = _project()
+    only, sel = _targets(rule, where)
+    actions = [a for a, on in (("merge", merge), ("take-generated", take_generated),
+                               ("keep-mine", keep_mine)) if on]
+    if len(actions) > 1:
+        _fail("pass at most one of --merge / --take-generated / --keep-mine.")
+    try:
+        from . import reconcile as reconcilelib
+
+        loaded = load_pipeline(project, pipeline)
+        drifts = [
+            d for d in reconcilelib.find_drift(project, loaded)
+            if (only is None or d.rule in only)
+            and (sel is None or all(d.keys.get(k) == v for k, v in sel.items()))
+        ]
+    except SmoketreeError as exc:
+        _fail(str(exc))
+        return
+
+    if not drifts:
+        typer.secho("No drift — every authored copy is up to date with its template.",
+                    fg=typer.colors.GREEN)
+        return
+
+    if not actions:
+        typer.secho(f"{len(drifts)} authored cop(ies) have drifted:", bold=True)
+        for d in drifts:
+            edited = " (you edited it)" if d.copy_edited else ""
+            typer.echo(f"  {d.authored}{edited}")
+        typer.echo("\nResolve with --merge, --take-generated, or --keep-mine.")
+        return
+
+    action = actions[0]
+    for d in drifts:
+        try:
+            status = reconcilelib.resolve(d, action)
+        except SmoketreeError as exc:
+            typer.secho(f"  {d.authored}: {exc}", fg=typer.colors.RED)
+            continue
+        typer.echo(f"  {d.authored}: {status}")
+    typer.secho("Done.", fg=typer.colors.GREEN)
+
+
+@app.command()
 def purge(
     pipeline: str = typer.Argument(..., help="Pipeline."),
 ) -> None:
@@ -242,6 +303,9 @@ def purge(
     state_path = project.state_dir / f"{pipeline}.json"
     if state_path.exists():
         state_path.unlink()
+    forkbase = project.forkbase_root / pipeline
+    if forkbase.is_dir():
+        shutil.rmtree(forkbase)
         typer.echo(f"  removed {state_path}")
         removed += 1
 

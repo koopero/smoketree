@@ -76,6 +76,11 @@ class Project:
     def state_dir(self) -> Path:
         return self.smoketree_dir / "state"
 
+    @property
+    def forkbase_root(self) -> Path:
+        """Where authored fork-bases live (the template content at courtesy-copy time)."""
+        return self.smoketree_dir / "forkbase"
+
     # ----- definition loading ---------------------------------------------- #
 
     def graph_path(self, graph_id: str) -> Path:

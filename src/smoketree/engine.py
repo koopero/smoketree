@@ -154,6 +154,7 @@ def _seed_authored(project: Project, loaded: LoadedPipeline, report: Reporter) -
     the file downstream consumes. Deleting the authored copy re-seeds it next pass.
     """
     root = project.root
+    base_root = project.forkbase_root / loaded.id
     for rule in loaded.rules:
         if not rule.enabled or not rule.author:
             continue
@@ -168,10 +169,15 @@ def _seed_authored(project: Project, loaded: LoadedPipeline, report: Reporter) -
                 template = root / rel
                 if not template.is_file():
                     continue
-                authored = root / decl_pat.fill(m.groupdict())
+                authored_rel = decl_pat.fill(m.groupdict())
+                authored = root / authored_rel
                 if not authored.exists():
                     authored.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(template, authored)
+                    # Record the fork-base (template content at copy time) for reconcile.
+                    base = base_root / authored_rel
+                    base.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(template, base)
                     report(f"  author {authored}")
 
 

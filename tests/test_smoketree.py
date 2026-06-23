@@ -915,6 +915,97 @@ def test_author_unknown_port_rejected(tmp_path: Path):
         load_pipeline(project, "g")
 
 
+# --------------------------------------------------------------------------- #
+# author reconcile (Phase 2): drift detection + 3-way merge / take / keep
+# --------------------------------------------------------------------------- #
+
+
+def _drifted_author_project(tmp_path: Path) -> Project:
+    """Author project where the template has moved away from the seeded copy."""
+    project = make_project(tmp_path, AUTHOR_PIPE)
+    write(tmp_path, "src/p.txt", "line one\nline two\nline three\n")
+    run(project)  # seeds copy + fork-base from template
+    return project
+
+
+def test_reconcile_reports_no_drift_when_template_unchanged(tmp_path: Path):
+    from smoketree import reconcile as rec
+
+    project = _drifted_author_project(tmp_path)
+    assert rec.find_drift(project, load_pipeline(project, "g")) == []
+
+
+def test_reconcile_detects_drift(tmp_path: Path):
+    from smoketree import reconcile as rec
+
+    project = _drifted_author_project(tmp_path)
+    write(tmp_path, "src/p.txt", "line one\nCHANGED two\nline three\n")
+    run(project)  # template moves; copy untouched -> drift
+
+    drifts = rec.find_drift(project, load_pipeline(project, "g"))
+    assert len(drifts) == 1
+    assert drifts[0].authored == tmp_path / "work/p/brief.md"
+    assert drifts[0].copy_edited is False
+
+
+def test_reconcile_merge_combines_edits(tmp_path: Path):
+    from smoketree import reconcile as rec
+
+    project = _drifted_author_project(tmp_path)
+    # human edits a different line than the generator will
+    write(tmp_path, "work/p/brief.md", "MY one\nline two\nline three\n")
+    # generator changes line three
+    write(tmp_path, "src/p.txt", "line one\nline two\nGEN three\n")
+    run(project)
+
+    [drift] = rec.find_drift(project, load_pipeline(project, "g"))
+    assert drift.copy_edited is True
+    status = rec.resolve(drift, "merge")
+    assert "0 conflict" in status or "cleanly" in status
+    # both edits survive
+    assert (tmp_path / "work/p/brief.md").read_text() == "MY one\nline two\nGEN three\n"
+    # fork-base advanced -> drift clears
+    assert rec.find_drift(project, load_pipeline(project, "g")) == []
+
+
+def test_reconcile_merge_marks_conflict(tmp_path: Path):
+    from smoketree import reconcile as rec
+
+    project = _drifted_author_project(tmp_path)
+    write(tmp_path, "work/p/brief.md", "line one\nMINE two\nline three\n")
+    write(tmp_path, "src/p.txt", "line one\nGEN two\nline three\n")  # same line, both
+    run(project)
+
+    [drift] = rec.find_drift(project, load_pipeline(project, "g"))
+    status = rec.resolve(drift, "merge")
+    assert "conflict" in status
+    merged = (tmp_path / "work/p/brief.md").read_text()
+    assert "MINE two" in merged and "GEN two" in merged  # conflict markers keep both
+
+
+def test_reconcile_take_generated_and_keep_mine(tmp_path: Path):
+    from smoketree import reconcile as rec
+
+    project = _drifted_author_project(tmp_path)
+    write(tmp_path, "work/p/brief.md", "my version\n")
+    write(tmp_path, "src/p.txt", "generated v2\n")
+    run(project)
+
+    [drift] = rec.find_drift(project, load_pipeline(project, "g"))
+    rec.resolve(drift, "take-generated")
+    assert (tmp_path / "work/p/brief.md").read_text() == "generated v2\n"
+    assert rec.find_drift(project, load_pipeline(project, "g")) == []  # base advanced
+
+    # now drift again; keep-mine leaves the copy but dismisses the drift
+    write(tmp_path, "work/p/brief.md", "my version 2\n")
+    write(tmp_path, "src/p.txt", "generated v3\n")
+    run(project)
+    [drift] = rec.find_drift(project, load_pipeline(project, "g"))
+    rec.resolve(drift, "keep-mine")
+    assert (tmp_path / "work/p/brief.md").read_text() == "my version 2\n"
+    assert rec.find_drift(project, load_pipeline(project, "g")) == []
+
+
 def test_workspace_server_select_and_note(tmp_path: Path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
