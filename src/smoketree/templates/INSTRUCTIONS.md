@@ -203,6 +203,33 @@ prompt). "Brainstorm again" = drop a new `runs/{run}/` marker; each marker runs 
 appending to the flat `ideas/` pool. Pair it with a `filter` that projects the
 "already handled" set into `done/` (excluding `recycle`, so recycled ideas regenerate).
 
+## Authoring generated files (`author`)
+
+By default a rule's output is *managed* — smoketree owns it and overwrites it on the next
+run, so hand-edits are lost. To hand-tune a generated file and keep your edits, mark its
+output port `author`:
+
+```yaml
+- name: brief
+  in:  { idea: "ideas/{idea}/seed.yaml" }
+  out: { brief: "ideas/{idea}/brief.md" }
+  author: [brief]
+  backend: claude
+  config: { prompt: "Write a brief for {idea}" }
+```
+
+The generator writes **`brief.template.md`** (managed — refreshed whenever its inputs
+change, never hand-edited). The engine courtesy-copies it to **`brief.md`** once, when
+absent; that copy is **yours** — never clobbered, and the file downstream consumes. So:
+
+- editing `brief.md` flows forward (it gates downstream) and survives regeneration;
+- when inputs change, the template refreshes but your copy is left alone;
+- deleting `brief.md` re-seeds it from the current template (a clean "reset to generated");
+- `purge` removes the template, not your copy.
+
+(Seeing what the template has drifted to since you forked — and merging it back in — is a
+later addition; for now `diff brief.template.md brief.md` shows it.)
+
 ## CLI
 
 ```

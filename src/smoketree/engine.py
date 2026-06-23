@@ -19,7 +19,7 @@ from typing import Callable
 import jsonschema
 
 from .backends import ExecutionContext, get_backend
-from .bind import Binding, Pattern, bind_rule
+from .bind import Binding, Pattern, bind_rule, template_pattern
 from .cache import State, hash_file, hash_text
 from .errors import ExecutionError
 from .loader import load_yaml
@@ -144,6 +144,35 @@ def _seed_feedback(project: Project, loaded: LoadedPipeline, report: Reporter) -
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(_channel_seed(channel))
                     report(f"  seed   {path}")
+
+
+def _seed_authored(project: Project, loaded: LoadedPipeline, report: Reporter) -> None:
+    """Courtesy-copy each authored output's template to its authored copy when absent.
+
+    The generator writes ``name.template.ext`` (a managed output); the authored copy
+    ``name.ext`` is seeded once from it and thereafter human-owned — never clobbered, and
+    the file downstream consumes. Deleting the authored copy re-seeds it next pass.
+    """
+    root = project.root
+    for rule in loaded.rules:
+        if not rule.enabled or not rule.author:
+            continue
+        for port in rule.author:
+            decl_pat = Pattern.compile(rule.out[port])
+            tpl_pat = Pattern.compile(template_pattern(rule.out[port]))
+            for rel in globlib.glob(tpl_pat.glob_str, root_dir=str(root), recursive=True):
+                rel = rel.replace("\\", "/")
+                m = tpl_pat.regex.match(rel)
+                if not m:
+                    continue
+                template = root / rel
+                if not template.is_file():
+                    continue
+                authored = root / decl_pat.fill(m.groupdict())
+                if not authored.exists():
+                    authored.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(template, authored)
+                    report(f"  author {authored}")
 
 
 def _inputs_present(binding: Binding) -> bool:
@@ -362,6 +391,7 @@ def run(
     executed = 0
     for iteration in range(1, max_iter + 1):
         _seed_feedback(project, loaded, report)
+        _seed_authored(project, loaded, report)
         bindings = [
             b
             for rule in loaded.rules

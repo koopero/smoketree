@@ -836,6 +836,85 @@ def test_plan_respects_only(tmp_path: Path):
     assert entries and all(e.identity.startswith("a") for e in entries)
 
 
+# --------------------------------------------------------------------------- #
+# author: generated template + courtesy-seeded, human-owned copy (Phase 1)
+# --------------------------------------------------------------------------- #
+
+
+AUTHOR_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: gen\n"
+    '    in:\n      seed: "src/{m}.txt"\n'
+    '    out:\n      brief: "work/{m}/brief.md"\n'
+    "    author: [brief]\n"
+    '    run: "cp {seed} {brief}"\n'
+    "  - name: use\n"
+    '    in:\n      brief: "work/{m}/brief.md"\n'
+    '    out:\n      final: "work/{m}/final.md"\n'
+    '    run: "cp {brief} {final}"\n'
+)
+
+
+def _author_project(tmp_path: Path, seed: str = "GEN1\n") -> Project:
+    project = make_project(tmp_path, AUTHOR_PIPE)
+    write(tmp_path, "src/p.txt", seed)
+    return project
+
+
+def test_author_seeds_copy_from_template(tmp_path: Path):
+    project = _author_project(tmp_path)
+    run(project)
+    # the generator writes the template; the authored copy is seeded from it; downstream
+    # consumes the authored copy
+    assert (tmp_path / "work/p/brief.template.md").read_text() == "GEN1\n"
+    assert (tmp_path / "work/p/brief.md").read_text() == "GEN1\n"
+    assert (tmp_path / "work/p/final.md").read_text() == "GEN1\n"
+    assert run(project) == 0  # idempotent
+
+
+def test_author_copy_not_clobbered_when_template_regenerates(tmp_path: Path):
+    project = _author_project(tmp_path)
+    run(project)
+
+    # hand-edit the authored copy: it gates downstream
+    write(tmp_path, "work/p/brief.md", "MY EDIT\n")
+    run(project)
+    assert (tmp_path / "work/p/final.md").read_text() == "MY EDIT\n"
+
+    # the generator's inputs change -> the template refreshes, but the authored copy and
+    # everything downstream of it are left alone
+    write(tmp_path, "src/p.txt", "GEN2\n")
+    run(project)
+    assert (tmp_path / "work/p/brief.template.md").read_text() == "GEN2\n"  # template moved
+    assert (tmp_path / "work/p/brief.md").read_text() == "MY EDIT\n"        # copy preserved
+    assert (tmp_path / "work/p/final.md").read_text() == "MY EDIT\n"        # downstream too
+
+
+def test_author_delete_reseeds_from_current_template(tmp_path: Path):
+    project = _author_project(tmp_path)
+    run(project)
+    write(tmp_path, "src/p.txt", "GEN2\n")
+    run(project)  # template now GEN2, copy still GEN1
+    assert (tmp_path / "work/p/brief.md").read_text() == "GEN1\n"
+
+    (tmp_path / "work/p/brief.md").unlink()  # delete-to-reseed
+    run(project)
+    assert (tmp_path / "work/p/brief.md").read_text() == "GEN2\n"  # re-copied from template
+
+
+def test_author_unknown_port_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n  - name: r\n"
+        '    in:\n      x: "a.txt"\n'
+        '    out:\n      y: "o.txt"\n'
+        "    author: [bogus]\n"
+        '    run: "cp {x} {y}"\n',
+    )
+    with pytest.raises(ValidationError, match="not in out"):
+        load_pipeline(project, "g")
+
+
 def test_workspace_server_select_and_note(tmp_path: Path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

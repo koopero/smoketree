@@ -85,6 +85,14 @@ def _validate(pipeline_id: str, pipeline: Pipeline) -> None:
                 f"input. Inputs: {', '.join(sorted(rule.in_)) or '(none)'}."
             )
 
+        unknown_author = set(rule.author) - set(rule.out)
+        if unknown_author:
+            raise ValidationError(
+                f"Rule '{rule.name}': author lists output(s) "
+                f"{', '.join(sorted(unknown_author))} not in out: "
+                f"{', '.join(sorted(rule.out)) or '(none)'}."
+            )
+
         ctx_collisions = set(rule.context) & (set(rule.in_) | set(rule.out))
         if ctx_collisions:
             raise ValidationError(

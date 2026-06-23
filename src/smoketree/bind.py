@@ -20,10 +20,21 @@ import glob as globlib
 import json
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .errors import ExecutionError, ValidationError
 from .models import Rule
+
+def template_pattern(out_pattern: str) -> str:
+    """The managed-template path for an authored output ('brief.md' -> 'brief.template.md').
+
+    The generator writes this file; the engine courtesy-copies it to the authored copy
+    (the declared ``out`` path) once. The transform only touches the final segment, so
+    ``{key}`` axes are preserved.
+    """
+    p = PurePosixPath(out_pattern)
+    return str(p.with_name(f"{p.stem}.template{p.suffix}"))
+
 
 # A pattern token: {key}, ** or * (everything else is literal).
 _TOKEN = re.compile(r"\{(\w+)\}|\*\*|\*")
@@ -225,7 +236,12 @@ def _resolve_context(root: Path, keys: dict[str, str], patterns: dict[str, Patte
 def bind_rule(root: Path, rule: Rule) -> list[Binding]:
     """Enumerate every runnable binding of ``rule`` against the tree under ``root``."""
     in_patterns = {name: Pattern.compile(p) for name, p in rule.in_.items()}
-    out_patterns = {name: Pattern.compile(p) for name, p in rule.out.items()}
+    # An authored port's *managed* output is its template; the engine seeds the authored
+    # copy separately. So the binding targets the template path here.
+    out_patterns = {
+        name: Pattern.compile(template_pattern(p) if name in rule.author else p)
+        for name, p in rule.out.items()
+    }
     ctx_patterns = {name: Pattern.compile(p) for name, p in rule.context.items()}
     list_inputs = {name for name, pat in in_patterns.items() if pat.has_glob}
     bound_keys = {k for pat in in_patterns.values() for k in pat.keys}

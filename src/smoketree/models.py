@@ -168,6 +168,10 @@ class Rule(BaseModel):
     # keep/drop predicate: the rule emits its output only for bindings that pass, and
     # drops the managed output of bindings that fail (a data-driven selector/gate).
     filter: FilterSpec | None = None
+    # output port names to *author*: the generator writes a managed `name.template.ext`,
+    # which the engine courtesy-copies to the authored `name.ext` once (when absent) — a
+    # human-owned copy that is never clobbered and is what downstream consumes.
+    author: list[str] = Field(default_factory=list)
 
 
 class Pipeline(BaseModel):
