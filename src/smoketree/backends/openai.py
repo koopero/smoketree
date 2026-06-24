@@ -76,10 +76,10 @@ class OpenAIBackend(Backend):
 
         from openai import OpenAI
 
-        client = OpenAI()
         try:
+            client = OpenAI()  # reads OPENAI_API_KEY; raises here if it's missing
             resp = client.chat.completions.create(**kwargs)
-        except Exception as exc:  # network/API failures
+        except Exception as exc:  # missing key / network / API failures
             raise ExecutionError(f"OpenAI API call failed: {exc}") from exc
 
         choice = resp.choices[0]
