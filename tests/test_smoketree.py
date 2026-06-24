@@ -1980,3 +1980,23 @@ def test_openai_schema_constrains_and_writes_yaml(tmp_path: Path, monkeypatch):
     assert "minLength" not in str(js["schema"])  # unsupported keyword stripped for strict mode
     out = (tmp_path / "work/alpha/out.yaml").read_text()
     assert _yaml.safe_load(out) == {"name": "zonk"}
+
+
+def test_openai_strict_schema_keeps_property_named_like_a_keyword():
+    from smoketree.backends.openai import _strict_schema
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["format", "title"],
+        "properties": {
+            # a field literally named "format" (a keyword) — must survive
+            "format": {"type": "string", "enum": ["song", "comic"]},
+            "title": {"type": "string", "minLength": 1},  # real keyword -> stripped
+        },
+    }
+    out = _strict_schema(schema)
+    assert out["required"] == ["format", "title"]              # required untouched
+    assert "format" in out["properties"]                       # property name survived
+    assert out["properties"]["format"]["enum"] == ["song", "comic"]
+    assert "minLength" not in out["properties"]["title"]       # keyword stripped

@@ -31,14 +31,39 @@ _UNSUPPORTED = frozenset({
     "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
     "default", "examples",
 })
+# Keywords whose value is a {name: subschema} map — recurse into the values, keep the names
+# (a field can legitimately be named e.g. "format" or "pattern").
+_SUBSCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
+# Keywords whose value is a list of subschemas.
+_SUBSCHEMA_LISTS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+# Keywords whose value is a single subschema (or, for additionalProperties, a bool).
+_SUBSCHEMA_ONE = frozenset({"items", "additionalProperties", "not", "if", "then", "else", "contains"})
 
 
-def _strict_schema(schema: Any) -> Any:
-    if isinstance(schema, dict):
-        return {k: _strict_schema(v) for k, v in schema.items() if k not in _UNSUPPORTED}
-    if isinstance(schema, list):
-        return [_strict_schema(v) for v in schema]
-    return schema
+def _strict_schema(node: Any) -> Any:
+    """Strip strict-mode-unsupported validation keywords, treating ``node`` as JSON Schema.
+
+    Crucially, the unsupported names are stripped only where they're *keywords* — never when
+    they're property names (under ``properties``) or values (in ``required``/``enum``), so a
+    field literally named ``format`` survives.
+    """
+    if isinstance(node, list):
+        return [_strict_schema(v) for v in node]
+    if not isinstance(node, dict):
+        return node
+    out: dict = {}
+    for key, value in node.items():
+        if key in _UNSUPPORTED:
+            continue  # a schema keyword we must drop
+        if key in _SUBSCHEMA_MAPS and isinstance(value, dict):
+            out[key] = {name: _strict_schema(sub) for name, sub in value.items()}
+        elif key in _SUBSCHEMA_LISTS and isinstance(value, list):
+            out[key] = [_strict_schema(v) for v in value]
+        elif key in _SUBSCHEMA_ONE:
+            out[key] = _strict_schema(value) if isinstance(value, (dict, list)) else value
+        else:
+            out[key] = value  # required / enum / type / const / description / … — keep verbatim
+    return out
 
 
 class OpenAIBackend(Backend):
