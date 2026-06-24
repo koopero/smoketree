@@ -11,6 +11,7 @@ from ..errors import ExecutionError
 from .base import Backend, ExecutionContext
 from .claude import ClaudeBackend
 from .comfyui import ComfyUIBackend
+from .explode import ExplodeBackend
 from .ollama import OllamaBackend
 from .replicate import ReplicateBackend
 from .shell import ShellBackend
@@ -21,6 +22,7 @@ _BACKENDS: dict[str, type[Backend]] = {
     "replicate": ReplicateBackend,
     "claude": ClaudeBackend,
     "comfyui": ComfyUIBackend,
+    "explode": ExplodeBackend,
 }
 
 

@@ -1100,7 +1100,7 @@ def test_reroll_varies_seed_at_roll_one_else_identity(tmp_path: Path, monkeypatc
         '    in:\n      brief: "sources/{m}/brief.txt"\n'
         '    out:\n      out: "work/{m}/out.txt"\n'
         "    config:\n      model: testmodel\n"
-        '      prompt: "p for {m}"\n',
+        '      prompt: "p for {{ m }}"\n',
     )
     write(tmp_path, "sources/alpha/brief.txt", "x\n")
     run(project)
@@ -1178,6 +1178,259 @@ def test_workspace_server_select_and_note(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- #
+# Trigger (declarative "generate more") + artifact graph + dashboard API
+# --------------------------------------------------------------------------- #
+
+
+TRIGGER_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: brainstorm\n"
+    '    in:\n      brief: "runs/{run}/go.txt"\n'
+    '    context:\n      ignore: "done/*/lede.yaml"\n'
+    '    out:\n      idea: "ideas/{idea}/seed.yaml"\n'
+    '    run: "python scripts/brainstorm.py {idea} {ignore}"\n'
+    "    trigger:\n"
+    '      marker: "runs/{run}/go.txt"\n'
+    '      describe: "more please"\n'
+    '      content: "go\\n"\n'
+    "  - name: mark\n"
+    '    in:\n      seed: "ideas/{idea}/seed.yaml"\n'
+    '      status: "ideas/{idea}/status.yaml"\n'
+    '    out:\n      lede: "done/{idea}/lede.yaml"\n'
+    "    filter: { input: status, field: status, among: [approve, ignore] }\n"
+    '    run: "cp {seed} {lede}"\n'
+)
+
+
+def test_trigger_rejects_keyless_marker():
+    from smoketree.models import TriggerSpec
+
+    with pytest.raises(Exception):
+        TriggerSpec(marker="runs/go.txt")  # no {key} axis
+
+
+def test_trigger_marker_key_must_be_bound_by_input(tmp_path: Path):
+    bad = (
+        "name: g\nrules:\n"
+        "  - name: g\n"
+        '    in:\n      x: "src/a.txt"\n'
+        '    out:\n      y: "out/{run}/y.txt"\n'
+        '    run: "cp {x} {y}"\n'
+        "    trigger: { marker: \"runs/{run}/go.txt\" }\n"
+    )
+    project = make_project(tmp_path, bad)
+    with pytest.raises(ValidationError):
+        load_pipeline(project, "g")
+
+
+def test_fire_trigger_writes_marker_and_run_fires_next_round(tmp_path: Path):
+    from smoketree.workspace.actions import fire_trigger
+
+    project = make_project(tmp_path, TRIGGER_PIPE)
+    write(tmp_path, "scripts/brainstorm.py", BRAINSTORM_PY)
+    write(tmp_path, "runs/r1/go.txt", "make ideas\n")
+    _run_log(project)
+    assert (tmp_path / "ideas/sunset/seed.yaml").exists()
+
+    # Approve sunset and project it (so the ignore list has it before the next round).
+    write(tmp_path, "ideas/sunset/status.yaml", "status: approve\n")
+    _run_log(project)
+    assert (tmp_path / "done/sunset/lede.yaml").exists()
+
+    # Fire the trigger: a fresh marker is written, and the next run skips sunset.
+    rule_obj = next(r for r in load_pipeline(project, "g").rules if r.name == "brainstorm")
+    marker = fire_trigger(project, rule_obj, round_id="r-test-2")
+    assert marker == tmp_path / "runs/r-test-2/go.txt"
+    assert marker.read_text() == "go\n"
+
+    n, log = _run_log(project)
+    assert any("brainstorm(run=r-test-2)" in line for line in log)
+    assert (tmp_path / "ideas/forest/seed.yaml").exists()  # a new idea, sunset skipped
+
+
+def test_build_graph_states(tmp_path: Path):
+    from smoketree.workspace.graph import build_graph
+
+    project = make_project(tmp_path, MULTI_CHANNEL_PIPE)
+    write(tmp_path, "sources/alpha/p.txt", "an idea\n")
+    run(project)
+
+    graph = build_graph(project, "g")
+    names = [r.name for r in graph.rules]
+    assert "render" in names
+    render = next(r for r in graph.rules if r.name == "render")
+    assert len(render.instances) == 1
+    inst = render.instances[0]
+    assert inst.state == "SKIP"  # built and up to date
+    assert inst.primary is not None and inst.primary.exists
+    assert {c.name for c in inst.channels} == {"status", "content"}
+
+
+def test_workspace_server_graph_trigger_and_cell_run(tmp_path: Path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from smoketree.workspace.server import create_app
+
+    project = make_project(tmp_path, TRIGGER_PIPE)
+    write(tmp_path, "scripts/brainstorm.py", BRAINSTORM_PY)
+    write(tmp_path, "runs/r1/go.txt", "make ideas\n")
+    run(project)
+
+    client = TestClient(create_app(project, "g"))
+
+    # /api/graph enumerates rules with a declared trigger surfaced.
+    graph = client.get("/api/graph").json()
+    brain = next(r for r in graph["rules"] if r["name"] == "brainstorm")
+    assert brain["trigger"] == {"describe": "more please"}
+
+    # /api/trigger writes a fresh marker.
+    t = client.post("/api/trigger", json={"rule": "brainstorm"})
+    assert t.status_code == 200
+    assert (tmp_path / t.json()["marker"]).exists()
+
+    # an unknown / non-trigger rule is rejected
+    assert client.post("/api/trigger", json={"rule": "mark"}).status_code == 400
+    assert client.post("/api/trigger", json={"rule": "nope"}).status_code == 404
+
+    # /api/run accepts an optional narrowing body (only/where) and still streams.
+    r = client.post("/api/run", json={"only": ["mark"]})
+    assert r.status_code == 200
+    assert "[OK] run complete" in r.text
+
+    # /file serves a project file but refuses traversal outside the root.
+    f = client.get("/file", params={"path": "ideas/sunset/seed.yaml"})
+    assert f.status_code == 200 and "sunset" in f.text
+    assert client.get("/file", params={"path": "../escape.txt"}).status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# Prompt templating (Jinja2 over parsed upstream data)
+# --------------------------------------------------------------------------- #
+
+
+def test_render_prompt_jinja_over_structured_data(tmp_path: Path):
+    from smoketree.backends._prompt import render_prompt
+
+    write(tmp_path, "a.json", '{"name": "Howlers", "style": "post-rock"}')
+    write(tmp_path, "b.json", '{"name": "Revival", "style": "blues"}')
+    write(tmp_path, "brief.txt", "make it weird")
+
+    template = (
+        "Brief: {{ brief }}\n"
+        "{% for b in others %}- {{ b.name }} ({{ b.style }})\n{% endfor %}"
+        "names: {{ others | map(attribute='name') | join(', ') }}\n"
+        "one: {{ single | to_yaml }}"
+    )
+    text, images = render_prompt(
+        template,
+        {
+            "others": [tmp_path / "a.json", tmp_path / "b.json"],
+            "brief": tmp_path / "brief.txt",
+            "single": tmp_path / "a.json",
+        },
+        {"run": "r1"},
+    )
+    assert images == []
+    assert "Brief: make it weird" in text
+    assert "- Howlers (post-rock)" in text and "- Revival (blues)" in text
+    assert "names: Howlers, Revival" in text
+    assert "name: Howlers" in text  # to_yaml inlined the parsed object
+
+
+def test_render_prompt_attaches_images_and_renders_empty(tmp_path: Path):
+    from smoketree.backends._prompt import render_prompt
+
+    (tmp_path / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    text, images = render_prompt("see: {{ cover }}!", {"cover": tmp_path / "pic.png"}, {})
+    assert images == [tmp_path / "pic.png"]
+    assert text == "see: !"
+
+
+def test_render_prompt_undefined_is_execution_error(tmp_path: Path):
+    from smoketree.backends._prompt import render_prompt
+
+    with pytest.raises(ExecutionError):
+        render_prompt("{{ nope }}", {}, {"m": "alpha"})
+
+
+# --------------------------------------------------------------------------- #
+# Explode backend: fan a data-file list out into per-item directories
+# --------------------------------------------------------------------------- #
+
+
+def test_explode_backend_fans_list_into_dirs(tmp_path: Path):
+    import json
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: explode\n"
+        '    in:\n      list: "in/items.json"\n'
+        '    out:\n      item: "out/{slug}/item.json"\n'
+        "    backend: explode\n"
+        "    config: { items: things, key: name }\n",
+    )
+    write(tmp_path, "in/items.json",
+          '{"things": [{"name": "Red Fox", "n": 1}, {"name": "blue jay", "n": 2}]}')
+    run(project)
+
+    fox = tmp_path / "out/red-fox/item.json"
+    jay = tmp_path / "out/blue-jay/item.json"
+    assert fox.exists() and jay.exists()
+    assert json.loads(fox.read_text())["n"] == 1
+    assert json.loads(jay.read_text())["n"] == 2
+
+
+def test_explode_backend_indexes_when_no_key(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: explode\n"
+        '    in:\n      list: "in/items.json"\n'
+        '    out:\n      item: "out/{i}/item.json"\n'
+        "    backend: explode\n",
+    )
+    write(tmp_path, "in/items.json", '[{"name": "a"}, {"name": "b"}, {"name": "c"}]')
+    run(project)
+    assert (tmp_path / "out/000/item.json").exists()
+    assert (tmp_path / "out/001/item.json").exists()
+    assert (tmp_path / "out/002/item.json").exists()
+
+
+def test_explode_backend_validates_items_against_schema(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: explode\n"
+        '    in:\n      list: "in/items.json"\n'
+        '    out:\n      item: "out/{slug}/item.json"\n'
+        "    backend: explode\n"
+        "    config: { key: name }\n"
+        '    schema:\n      item: "schema/item.yaml"\n',
+    )
+    write(tmp_path, "schema/item.yaml",
+          '{"type": "object", "required": ["name", "n"], '
+          '"properties": {"name": {"type": "string"}, "n": {"type": "number"}}}')
+    write(tmp_path, "in/items.json", '[{"name": "ok", "n": 1}, {"name": "bad"}]')
+    with pytest.raises(ExecutionError, match="failed schema validation"):
+        run(project)
+
+
+def test_explode_requires_scatter_key(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: explode\n"
+        '    in:\n      list: "in/items.json"\n'
+        '    out:\n      item: "out/item.json"\n'   # no {key} -> not a scatter
+        "    backend: explode\n",
+    )
+    with pytest.raises(ValidationError, match="scatter"):
+        load_pipeline(project, "g")
+
+
+# --------------------------------------------------------------------------- #
 # Loader + scaffold (carried over)
 # --------------------------------------------------------------------------- #
 
@@ -1242,7 +1495,7 @@ def test_ollama_backend_runs_via_engine(tmp_path: Path, monkeypatch):
         '    in:\n      brief: "sources/{m}/brief.txt"\n'
         '    out:\n      prompt: "work/{m}/prompt.txt"\n'
         "    config:\n      model: testmodel\n      options: {num_predict: 16}\n"
-        '      prompt: "BRIEF={brief} KEY={m}"\n',
+        '      prompt: "BRIEF={{ brief }} KEY={{ m }}"\n',
     )
     write(tmp_path, "sources/alpha/brief.txt", "a winged thing\n")
     run(project)
@@ -1380,7 +1633,7 @@ def test_claude_backend_runs_via_engine(tmp_path: Path, monkeypatch):
         '    in:\n      brief: "sources/{m}/brief.txt"\n'
         '    out:\n      prompt: "work/{m}/prompt.txt"\n'
         "    config:\n      model: claude-test\n      max_tokens: 64\n"
-        '      system: "SYS {m}"\n      prompt: "BRIEF={brief} KEY={m}"\n',
+        '      system: "SYS {{ m }}"\n      prompt: "BRIEF={{ brief }} KEY={{ m }}"\n',
     )
     write(tmp_path, "sources/alpha/brief.txt", "a winged thing\n")
     run(project)
@@ -1562,7 +1815,7 @@ def test_ollama_schema_constrains_and_writes_yaml(tmp_path: Path, monkeypatch):
         '    out:\n      data: "work/{m}/out.yaml"\n'
         '    schema:\n      data: "schema/thing.yaml"\n'
         "    config:\n      model: testmodel\n"
-        '      prompt: "name for {brief}"\n',
+        '      prompt: "name for {{ brief }}"\n',
     )
     write(tmp_path, "schema/thing.yaml", SCHEMA_YAML)
     write(tmp_path, "sources/alpha/brief.txt", "a winged thing\n")
@@ -1618,7 +1871,7 @@ def test_claude_schema_constrains_and_writes_yaml(tmp_path: Path, monkeypatch):
         '    out:\n      data: "work/{m}/out.yaml"\n'
         '    schema:\n      data: "schema/thing.yaml"\n'
         "    config:\n      model: claude-test\n"
-        '      prompt: "name for {brief}"\n',
+        '      prompt: "name for {{ brief }}"\n',
     )
     write(tmp_path, "schema/thing.yaml", SCHEMA_YAML)
     write(tmp_path, "sources/alpha/brief.txt", "a winged thing\n")

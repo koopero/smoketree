@@ -70,6 +70,17 @@ def _validate(pipeline_id: str, pipeline: Pipeline) -> None:
                 f"Rule '{rule.name}': backend 'shell' requires a 'run' command."
             )
 
+        if rule.backend == "explode":
+            if len(rule.in_) != 1 or len(rule.out) != 1:
+                raise ValidationError(
+                    f"Rule '{rule.name}': explode needs exactly one input and one output."
+                )
+            if not (out_keys - in_keys):
+                raise ValidationError(
+                    f"Rule '{rule.name}': explode output needs a scatter {{key}} not bound "
+                    f"by the input (e.g. out: bands/{{band}}/band.json)."
+                )
+
         ports = set(rule.in_) | set(rule.out)
         unknown_ports = set(rule.schemas) - ports
         if unknown_ports:
@@ -121,6 +132,17 @@ def _validate(pipeline_id: str, pipeline: Pipeline) -> None:
                     f"Rule '{rule.name}': feedback channel '{channel.name}' uses key(s) "
                     f"{', '.join(sorted(unknown))} that the rule doesn't bind. "
                     f"Keys available: {', '.join(sorted(in_keys | out_keys)) or '(none)'}."
+                )
+
+        if rule.trigger is not None:
+            marker_keys = set(Pattern.compile(rule.trigger.marker).keys)
+            unbound = marker_keys - in_keys
+            if unbound:
+                raise ValidationError(
+                    f"Rule '{rule.name}': trigger marker uses key(s) "
+                    f"{', '.join(sorted(unbound))} not bound by any input — a fired marker "
+                    f"wouldn't create a new binding. Input keys: "
+                    f"{', '.join(sorted(in_keys)) or '(none)'}."
                 )
 
         # `run` may reference input/output/context names and any bound key. Output keys

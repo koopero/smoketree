@@ -313,6 +313,7 @@ def _execute(project: Project, binding: Binding, report: Reporter) -> None:
         keys=binding.keys,
         inputs=binding.inputs,
         outputs=binding.outputs,
+        out_patterns=dict(binding.rule.out),
         command=binding.command,
         config=binding.rule.config,
         schemas=schemas,

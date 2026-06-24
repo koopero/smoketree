@@ -126,6 +126,35 @@ class FilterSpec(BaseModel):
         return value in self.among
 
 
+class TriggerSpec(BaseModel):
+    """A human-fired "do it again" hook for a generator/scatter rule.
+
+    ``marker`` is a path-pattern carrying a fresh axis (e.g. ``runs/{run}/go.txt``) that
+    is normally one of the rule's inputs: firing the trigger writes a new marker file with
+    a freshly-minted round id, which the rule's input glob picks up as a new binding — so
+    the rule re-runs to produce the next round (a brainstorm scatter reads prior picks as
+    ``context``, so the pool grows without the trigger re-firing on its own). The workspace
+    surfaces a "Generate more" button for any rule that declares one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    marker: str                  # path-pattern with a fresh axis, e.g. "runs/{run}/go.txt"
+    describe: str | None = None  # button hint shown in the workspace
+    content: str = ""            # body written into each new marker file
+
+    @model_validator(mode="after")
+    def _check(self) -> "TriggerSpec":
+        from .bind import Pattern
+
+        if not Pattern.compile(self.marker).keys:
+            raise ValueError(
+                f"trigger marker '{self.marker}' needs at least one {{key}} axis to mint "
+                f"a fresh round (e.g. 'runs/{{run}}/go.txt')."
+            )
+        return self
+
+
 class Rule(BaseModel):
     """One transform: input path-pattern(s) -> output path-pattern(s) + a command.
 
@@ -176,6 +205,9 @@ class Rule(BaseModel):
     # the seed, so bumping it re-runs just that cell with a fresh seed (deliberately
     # breaking content-addressed caching for a non-deterministic regenerate).
     reroll: bool = False
+    # human-fired "generate more" hook: writing a fresh marker re-triggers this rule for the
+    # next round (the workspace shows a "Generate more" button). See TriggerSpec.
+    trigger: TriggerSpec | None = None
 
 
 class Pipeline(BaseModel):

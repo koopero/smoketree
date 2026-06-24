@@ -24,6 +24,9 @@ class ExecutionContext:
     # input name -> a single resolved Path (scalar) or list[Path] (list/pool input)
     inputs: "dict[str, Path | list[Path]]"
     outputs: dict[str, Path]  # output name -> concrete path, or an owned dir for scatter
+    # output name -> raw path pattern (e.g. "bands/{band}/band.json"). A scatter-writing
+    # backend like `explode` fills the unbound {key} per item to place each output file.
+    out_patterns: dict[str, str] = field(default_factory=dict)
     # shell backend: the fully rendered command (None for non-shell backends)
     command: str | None = None
     # non-shell backends: the rule's `config` block (model, prompt, params, ...)

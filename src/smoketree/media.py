@@ -13,7 +13,7 @@ MediaType = str  # "image" | "audio" | "video" | "text" | "data"
 
 _EXT_MEDIA: dict[str, MediaType] = {
     "jpg": "image", "jpeg": "image", "png": "image", "gif": "image",
-    "webp": "image", "bmp": "image", "tiff": "image", "tif": "image",
+    "webp": "image", "bmp": "image", "tiff": "image", "tif": "image", "svg": "image",
     "wav": "audio", "mp3": "audio", "flac": "audio", "ogg": "audio",
     "aac": "audio", "m4a": "audio",
     "mp4": "video", "mov": "video", "avi": "video", "mkv": "video", "webm": "video",

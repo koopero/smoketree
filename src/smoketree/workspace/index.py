@@ -10,33 +10,16 @@ so an unbuilt rule contributes nothing.
 from __future__ import annotations
 
 import glob as globlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-
-import yaml
 
 from ..bind import Pattern
 from ..media import infer_media
 from ..project import Project
 from ..rules import load_pipeline
+from .channels import _SEED_PLACEHOLDER, ChannelView, read_channels
 
-_SEED_PLACEHOLDER = "(no feedback yet)\n"
-
-
-@dataclass
-class ChannelView:
-    """The current state of one feedback channel for one output instance."""
-
-    name: str
-    kind: str                       # "notes" | "select"
-    describe: str | None
-    path: Path
-    # notes:
-    has_note: bool = False
-    # select:
-    options: list[str] = field(default_factory=list)
-    value: str | None = None        # current selection
-    default: str | None = None
+__all__ = ["ChannelView", "FeedbackCard", "build_index", "add_note", "set_select"]
 
 
 @dataclass
@@ -65,26 +48,6 @@ def _slug(keys: dict[str, str]) -> str:
     return ",".join(f"{k}={keys[k]}" for k in sorted(keys))
 
 
-def _notes_has_content(path: Path) -> bool:
-    if not path.exists():
-        return False
-    stripped = path.read_text().strip()
-    return bool(stripped) and stripped != _SEED_PLACEHOLDER.strip()
-
-
-def _select_value(path: Path, channel) -> str | None:
-    """Read the current selection from a select channel's file (falling back to default)."""
-    if not path.exists():
-        return channel.default
-    try:
-        data = yaml.safe_load(path.read_text())
-    except yaml.YAMLError:
-        return None
-    if isinstance(data, dict):
-        return data.get(channel.name, channel.default)
-    return data if isinstance(data, str) else channel.default
-
-
 def build_index(project: Project, pipeline_id: str) -> list[FeedbackCard]:
     """Index every reviewable output (a rule with ``feedback``) from the last run."""
     loaded = load_pipeline(project, pipeline_id)
@@ -106,18 +69,7 @@ def build_index(project: Project, pipeline_id: str) -> list[FeedbackCard]:
                 continue
             keys = m.groupdict()
 
-            channels: list[ChannelView] = []
-            for ch in rule.feedback:
-                path = root / Pattern.compile(ch.path).fill(keys)
-                view = ChannelView(
-                    name=ch.name, kind=ch.kind, describe=ch.describe, path=path,
-                    options=ch.options, default=ch.default,
-                )
-                if ch.kind == "select":
-                    view.value = _select_value(path, ch)
-                else:
-                    view.has_note = _notes_has_content(path)
-                channels.append(view)
+            channels = read_channels(root, rule, keys)
 
             label = " · ".join(keys[k] for k in sorted(keys)) or rule.name
             cards.append(
