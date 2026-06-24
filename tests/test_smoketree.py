@@ -1915,3 +1915,68 @@ def test_claude_schema_constrains_and_writes_yaml(tmp_path: Path, monkeypatch):
     assert fmt["type"] == "json_schema" and fmt["schema"]["required"] == ["name"]
     out = (tmp_path / "work/alpha/out.yaml").read_text()
     assert _yaml.safe_load(out) == {"name": "zonk"}
+
+
+def test_openai_schema_constrains_and_writes_yaml(tmp_path: Path, monkeypatch):
+    import sys
+    import types
+
+    import yaml as _yaml
+
+    captured = {}
+
+    class Msg:
+        refusal = None
+
+        def __init__(self, content):
+            self.content = content
+
+    class Choice:
+        finish_reason = "stop"
+
+        def __init__(self, content):
+            self.message = Msg(content)
+
+    class Resp:
+        def __init__(self, content):
+            self.choices = [Choice(content)]
+
+    class FakeCompletions:
+        def create(self, **kw):
+            captured.update(kw)
+            return Resp('{"name": "zonk"}')
+
+    class FakeChat:
+        def __init__(self):
+            self.completions = FakeCompletions()
+
+    class FakeOpenAI:
+        def __init__(self, *a, **k):
+            self.chat = FakeChat()
+
+    fake = types.ModuleType("openai")
+    fake.OpenAI = FakeOpenAI
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: prompt\n    backend: openai\n"
+        '    in:\n      brief: "sources/{m}/brief.txt"\n'
+        '    out:\n      data: "work/{m}/out.yaml"\n'
+        '    schema:\n      data: "schema/thing.yaml"\n'
+        "    config:\n      model: gpt-test\n"
+        '      prompt: "name for {{ brief }}"\n',
+    )
+    # A schema with an OpenAI-unsupported keyword (minLength) — it must be stripped.
+    write(tmp_path, "schema/thing.yaml",
+          '{"type": "object", "additionalProperties": false, "required": ["name"], '
+          '"properties": {"name": {"type": "string", "minLength": 1}}}')
+    write(tmp_path, "sources/alpha/brief.txt", "a winged thing\n")
+    run(project)
+
+    js = captured["response_format"]["json_schema"]
+    assert js["strict"] is True and js["schema"]["required"] == ["name"]
+    assert "minLength" not in str(js["schema"])  # unsupported keyword stripped for strict mode
+    out = (tmp_path / "work/alpha/out.yaml").read_text()
+    assert _yaml.safe_load(out) == {"name": "zonk"}

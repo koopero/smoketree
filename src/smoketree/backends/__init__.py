@@ -13,6 +13,7 @@ from .claude import ClaudeBackend
 from .comfyui import ComfyUIBackend
 from .explode import ExplodeBackend
 from .ollama import OllamaBackend
+from .openai import OpenAIBackend
 from .replicate import ReplicateBackend
 from .shell import ShellBackend
 
@@ -21,6 +22,7 @@ _BACKENDS: dict[str, type[Backend]] = {
     "ollama": OllamaBackend,
     "replicate": ReplicateBackend,
     "claude": ClaudeBackend,
+    "openai": OpenAIBackend,
     "comfyui": ComfyUIBackend,
     "explode": ExplodeBackend,
 }
