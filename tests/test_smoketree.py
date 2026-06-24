@@ -1355,6 +1355,40 @@ def test_render_prompt_undefined_is_execution_error(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- #
+# Structured-output cleanup: prune empty trailing array items
+# --------------------------------------------------------------------------- #
+
+
+def test_write_structured_prunes_empty_array_items(tmp_path: Path):
+    from smoketree.serde import load_data, write_structured
+
+    # A constrained-decoding artifact: a real member plus a padded all-blank one.
+    text = (
+        '{"members": ['
+        '{"name": "Prickle", "species": "tortoise"}, '
+        '{"name": "", "species": "  "}'
+        '], "tags": ["a", "", "b"], "count": 0}'
+    )
+    out = tmp_path / "band.json"
+    write_structured(text, out)
+    data = load_data(out)
+    assert [m["name"] for m in data["members"]] == ["Prickle"]  # blank member dropped
+    assert data["tags"] == ["a", "b"]                            # blank string dropped
+    assert data["count"] == 0                                    # falsy-but-real kept
+
+
+def test_write_structured_keeps_partially_filled_items(tmp_path: Path):
+    from smoketree.serde import load_data, write_structured
+
+    # A member missing one field is NOT wholly empty — keep it (a real quality issue
+    # should surface in validation, not be silently dropped).
+    text = '{"members": [{"name": "Dew", "species": ""}]}'
+    out = tmp_path / "band.json"
+    write_structured(text, out)
+    assert load_data(out)["members"] == [{"name": "Dew", "species": ""}]
+
+
+# --------------------------------------------------------------------------- #
 # Explode backend: fan a data-file list out into per-item directories
 # --------------------------------------------------------------------------- #
 

@@ -40,11 +40,40 @@ def dump_data(obj: Any, path: Path) -> None:
     path.write_text(text)
 
 
+def _is_empty(value: Any) -> bool:
+    """Whether ``value`` carries no content (blank string, None, or an all-empty container)."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, dict):
+        return all(_is_empty(v) for v in value.values())
+    if isinstance(value, list):
+        return all(_is_empty(v) for v in value)
+    return False  # numbers / booleans carry content
+
+
+def prune_empty(value: Any) -> Any:
+    """Drop wholly-empty items from arrays (recursively).
+
+    Constrained-decoding LLM backends can pad an array with a trailing all-blank item the
+    model couldn't fill (it can't enforce item counts, and string `minLength` is only a
+    hint). Such items carry no content and would fail schema validation, so we strip them —
+    leaving partially-filled items intact (a real quality problem worth surfacing, not hiding).
+    """
+    if isinstance(value, dict):
+        return {k: prune_empty(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [prune_empty(v) for v in value if not _is_empty(v)]
+    return value
+
+
 def write_structured(text: str, path: Path) -> None:
     """Parse JSON ``text`` (a schema-constrained LLM response) and write it to ``path``.
 
     The on-disk format follows ``path``'s extension, so a ``.yaml`` output lands as YAML
-    even though the model returned JSON.
+    even though the model returned JSON. Wholly-empty trailing array items (a constrained-
+    decoding artifact) are pruned before writing.
     """
     try:
         obj = json.loads(text)
@@ -52,4 +81,4 @@ def write_structured(text: str, path: Path) -> None:
         raise SmoketreeError(
             f"Expected JSON matching the schema, got: {text[:200]!r} ({exc})."
         ) from exc
-    dump_data(obj, path)
+    dump_data(prune_empty(obj), path)
