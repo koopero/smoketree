@@ -44,9 +44,37 @@ def load_pipeline(project: Project, pipeline_id: str) -> LoadedPipeline:
     except PydanticValidationError as exc:
         raise ValidationError(f"Invalid pipeline '{pipeline_id}' ({path}):\n{exc}") from exc
 
+    _resolve_models(pipeline_id, pipeline)
     _validate(pipeline_id, pipeline)
     deps = infer_dependencies(pipeline)
     return LoadedPipeline(id=pipeline_id, pipeline=pipeline, deps=deps)
+
+
+def _resolve_models(pipeline_id: str, pipeline: Pipeline) -> None:
+    """Resolve each rule's ``model:`` reference into its ``backend`` + merged ``config``.
+
+    Runs before ``_validate`` so downstream (validation, engine, workspace) only ever sees
+    plain ``backend``/``config`` rules — the abstraction leaves no trace past load. The
+    def's config is merged *under* the rule's own (rule keys win), so per-rule ``prompt``/
+    ``system`` override shared model settings.
+    """
+    for rule in pipeline.rules:
+        if rule.model is None:
+            continue
+        mdef = pipeline.models.get(rule.model)
+        if mdef is None:
+            known = ", ".join(sorted(pipeline.models)) or "(none defined)"
+            raise ValidationError(
+                f"Pipeline '{pipeline_id}', rule '{rule.name}': model '{rule.model}' is not "
+                f"defined. Known models: {known}."
+            )
+        if "backend" in rule.model_fields_set:
+            raise ValidationError(
+                f"Pipeline '{pipeline_id}', rule '{rule.name}': set either 'model' or "
+                f"'backend', not both — the model def supplies the backend."
+            )
+        rule.backend = mdef.backend
+        rule.config = {**mdef.config, **rule.config}
 
 
 def _validate(pipeline_id: str, pipeline: Pipeline) -> None:

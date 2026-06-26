@@ -22,7 +22,8 @@ Run a pipeline named `demo` (file `graphs/demo.yaml`) with `smoketree run demo`.
 
 ## Rules
 
-A pipeline file is `{ name, rules: [...] }`. Each rule:
+A pipeline file is `{ name, models?: {...}, rules: [...] }` (see **Named models** for the
+optional `models:` block). Each rule:
 
 ```yaml
 - name: shout
@@ -75,6 +76,33 @@ fingerprint, so big media isn't re-read needlessly); identical content never reb
 that vanish from the regenerated set (e.g. an episode re-splitting 7→5 segments removes the
 2 stale ones), scoped to the binding so siblings are untouched. It never deletes authored
 sources.
+
+## Named models
+
+Define a backend + its settings **once** under a pipeline-level `models:` block and point
+rules at it with `model: <name>`, instead of repeating `backend` + `config` on every rule:
+
+```yaml
+name: g
+models:
+  writer:  { backend: openai, model: gpt-5.1, max_tokens: 8000 }
+  renderer: { backend: comfyui, workflow: graphs/comfyui/txt2img.json }
+rules:
+  - name: narrative
+    in:  { brief: "sources/brief.txt" }
+    out: { story: "work/story.txt" }
+    model: writer                      # backend + model + max_tokens come from the def
+    config: { prompt: "Write from: {brief}" }   # per-rule bits stay here
+```
+
+- A def is `{ backend, ...config }` — the extra keys are whatever that backend reads from
+  `config` (`model`, `max_tokens`, `options`, `workflow`, …).
+- `model:` pulls in the def's `backend` and merges its config **under** the rule's own —
+  so per-rule `prompt`/`system` override, and shared settings live in one place. Swapping
+  every rule that shares a model (e.g. `gemma4`/ollama → `gpt-5.1`/openai) is a one-line
+  edit to the def.
+- A rule sets **either** `model:` **or** `backend:`, not both — the def supplies the
+  backend. The reference is resolved away at load time; downstream sees a plain rule.
 
 ## Schemas & typed data
 

@@ -2455,3 +2455,89 @@ def test_openai_strict_schema_keeps_property_named_like_a_keyword():
     assert "format" in out["properties"]                       # property name survived
     assert out["properties"]["format"]["enum"] == ["song", "comic"]
     assert "minLength" not in out["properties"]["title"]       # keyword stripped
+
+
+# --------------------------------------------------------------------------- #
+# Named model defs (the `models:` block + per-rule `model:` reference)
+# --------------------------------------------------------------------------- #
+
+
+def _model_pipeline(body: str) -> str:
+    return (
+        "name: g\n"
+        "models:\n"
+        "  writer:\n"
+        "    backend: openai\n"
+        "    model: gpt-5.1\n"
+        "    max_tokens: 8000\n"
+        + body
+    )
+
+
+def test_model_ref_resolves_backend_and_merges_config(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        _model_pipeline(
+            "rules:\n"
+            '  - name: narrative\n'
+            '    in:\n      a: "x/{k}.txt"\n'
+            '    out:\n      b: "o/{k}.txt"\n'
+            "    model: writer\n"
+            '    config:\n      prompt: "write {a}"\n'
+        ),
+    )
+    loaded = load_pipeline(project, "g")
+    r = loaded.rules[0]
+    # backend comes from the def; def config is pulled in; per-rule config is preserved.
+    assert r.backend == "openai"
+    assert r.config["model"] == "gpt-5.1"
+    assert r.config["max_tokens"] == 8000
+    assert r.config["prompt"] == "write {a}"
+
+
+def test_model_ref_rule_config_overrides_def(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        _model_pipeline(
+            "rules:\n"
+            '  - name: narrative\n'
+            '    in:\n      a: "x/{k}.txt"\n'
+            '    out:\n      b: "o/{k}.txt"\n'
+            "    model: writer\n"
+            '    config:\n      max_tokens: 256\n      prompt: "write {a}"\n'
+        ),
+    )
+    loaded = load_pipeline(project, "g")
+    # the rule's own config wins on overlap (here it narrows max_tokens).
+    assert loaded.rules[0].config["max_tokens"] == 256
+
+
+def test_unknown_model_ref_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        _model_pipeline(
+            "rules:\n"
+            '  - name: narrative\n'
+            '    in:\n      a: "x/{k}.txt"\n'
+            '    out:\n      b: "o/{k}.txt"\n'
+            "    model: nope\n"
+        ),
+    )
+    with pytest.raises(ValidationError, match="model 'nope' is not defined"):
+        load_pipeline(project, "g")
+
+
+def test_model_and_backend_both_set_rejected(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        _model_pipeline(
+            "rules:\n"
+            '  - name: narrative\n'
+            '    in:\n      a: "x/{k}.txt"\n'
+            '    out:\n      b: "o/{k}.txt"\n'
+            "    model: writer\n"
+            "    backend: ollama\n"
+        ),
+    )
+    with pytest.raises(ValidationError, match="either 'model' or 'backend'"):
+        load_pipeline(project, "g")

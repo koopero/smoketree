@@ -155,6 +155,28 @@ class TriggerSpec(BaseModel):
         return self
 
 
+class ModelDef(BaseModel):
+    """A named, reusable ``backend`` + config bundle referenced by rules via ``model:``.
+
+    Declared once under the pipeline's ``models:`` block; a rule's ``model: <name>``
+    pulls in this def's backend and merges its config under the rule's own (rule keys
+    win, so per-rule ``prompt``/``system`` stay on the rule). Re-pointing every rule
+    that shares a model is then a one-line edit here — e.g. swapping a whole creative
+    pipeline from ``gemma4`` (ollama) to ``gpt-5.1`` (openai). ``extra`` fields are the
+    backend config (``model``, ``max_tokens``, ``options``, ``workflow``, …) — whatever
+    the chosen backend reads from ``ctx.config``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    backend: str
+
+    @property
+    def config(self) -> dict[str, Any]:
+        """The backend config carried by this def (every field except ``backend``)."""
+        return dict(self.model_extra or {})
+
+
 class Rule(BaseModel):
     """One transform: input path-pattern(s) -> output path-pattern(s) + a command.
 
@@ -175,6 +197,10 @@ class Rule(BaseModel):
     # generator consider existing artifacts (an ignore list) without depending on them —
     # the way to read your own output without a fixpoint cycle.
     context: dict[str, str] = Field(default_factory=dict)
+    # reference a named def from the pipeline's `models:` block: pulls in its backend and
+    # merges its config under this rule's `config` (rule keys win). Mutually exclusive with
+    # `backend` — the def supplies the backend. Resolved away at load time (see rules.py).
+    model: str | None = None
     backend: str = "shell"
     # set false to turn a rule (a whole stage) off without deleting it: it never binds,
     # runs, seeds its feedback, or surfaces in the workspace. Flip back to re-enable.
@@ -214,6 +240,8 @@ class Pipeline(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
+    # named model defs referenced by rules' `model:` field, resolved at load time.
+    models: dict[str, ModelDef] = Field(default_factory=dict)
     rules: list[Rule] = Field(default_factory=list)
 
 
