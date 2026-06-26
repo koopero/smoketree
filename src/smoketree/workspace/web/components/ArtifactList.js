@@ -29,6 +29,7 @@ export default {
     },
   },
   template: `
+    <div class="listwrap">
     <table class="arttable">
       <thead>
         <tr>
@@ -59,5 +60,6 @@ export default {
         <tr v-if="!rows.length"><td :colspan="columns.length" class="empty small">No matching artifacts.</td></tr>
       </tbody>
     </table>
+    </div>
   `,
 };

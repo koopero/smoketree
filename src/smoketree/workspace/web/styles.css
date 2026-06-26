@@ -168,3 +168,31 @@ html, body { height: 100%; }
 .outlist a:hover { text-decoration: underline; }
 .outlist .dim { color: #6b6f78; word-break: break-all; }
 .detsection.channels .channel:first-child { border-top: none; padding-top: 0; }
+
+/* Run-rules picker (run only selected rules from the UI) */
+.run-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.rule-picker { position: relative; }
+button.ghost { background: #262a33; color: #cdd2db; border: 1px solid #3a3d44;
+               border-radius: 8px; padding: 9px 14px; font: 600 13px/1 system-ui, sans-serif;
+               cursor: pointer; white-space: nowrap; }
+button.ghost:hover { background: #2d323d; border-color: #4a4f59; }
+.rule-menu { position: absolute; right: 0; top: calc(100% + 6px); width: 320px; max-height: 70vh;
+             overflow-y: auto; background: #1c1f26; border: 1px solid #2a2d34; border-radius: 10px;
+             padding: 8px; z-index: 5; box-shadow: 0 8px 28px rgba(0,0,0,0.45); }
+.rule-menu-head { display: flex; justify-content: space-between; align-items: center;
+                  font-size: 11px; color: #8b8f98; padding: 4px 6px 8px; }
+.rule-menu-head a { color: #7bbf7b; text-decoration: none; }
+.rule-menu-head a:hover { text-decoration: underline; }
+.rule-row { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px;
+            font-size: 13px; color: #cdd2db; cursor: pointer; }
+.rule-row:hover { background: #232730; }
+.rule-row .rule-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rule-row.work .rule-name { color: #eafff2; }
+.rule-badge { font-size: 10px; padding: 2px 7px; border-radius: 999px; white-space: nowrap;
+              background: #2f6f4f; color: #eafff2; }
+.rule-badge.dim { background: #232730; color: #6b6f78; }
+button.run-selected { width: 100%; margin-top: 8px; background: #2f6f4f; color: #eafff2;
+                      border: 1px solid #3a8a63; border-radius: 8px; padding: 9px 12px;
+                      font: 600 13px/1 system-ui, sans-serif; cursor: pointer; }
+button.run-selected:hover { background: #367c59; }
+button.run-selected:disabled { opacity: 0.5; cursor: default; }

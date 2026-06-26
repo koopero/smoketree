@@ -1,14 +1,20 @@
 """ComfyUI backend (path core): inject inputs into a workflow, submit, collect.
 
 Reads its settings from the rule's ``config`` block:
-  workflow      path to a workflow JSON (API format), relative to the project root  (required)
+  workflow      path to a workflow JSON (API format), relative to the project root; may
+                contain ``{key}`` axes (e.g. a generated ``songs/{song}/wf.json``)  (required)
   seed_inject   {node, field}: write the per-job seed into this workflow node field  (optional)
-  inputs        {name: {node, field}}: inject input ``name`` into that node field
-  outputs       {name: {node}}: collect the first image produced by that node
+  inputs        {name: {node, field}}: inject input ``name`` into that node field; OR
+                {name: {node_prefix, field}}: fan a list input across nodes ``<prefix>1..N``
+  outputs       {name: {node}}: collect the first media file (image / video / animation)
+                produced by that node
+  timeout       seconds to wait for the render before erroring (default 600; raise it for
+                slow renders like long video generation)  (optional)
 
-Each declared input is injected by media: an image is uploaded and its server-side name
-written to the field; text/data is read and its text written. Produced images are polled
-from history and downloaded to the rule's declared output paths.
+Each declared input is injected by media: an image / video / audio file is uploaded and its
+server-side name written to the field (feeding a LoadImage / LoadVideo / LoadAudio node);
+text/data is read and its text written. Produced media is polled from history and
+downloaded to the rule's declared output paths.
 """
 
 from __future__ import annotations
@@ -37,6 +43,10 @@ class ComfyUIBackend(Backend):
             raise ExecutionError(
                 f"Rule '{ctx.rule_name}': comfyui config needs a 'workflow' path."
             )
+        # Interpolate the binding's {key} axes so a per-binding workflow path works (e.g. a
+        # generated `songs/{song}/refframe.json`); plain paths have no {key} and pass through.
+        for key, val in ctx.keys.items():
+            workflow_rel = workflow_rel.replace("{" + key + "}", val)
         workflow_path = ctx.project.root / workflow_rel
         if not workflow_path.exists():
             raise ExecutionError(f"ComfyUI workflow not found: {workflow_path}.")
@@ -48,7 +58,8 @@ class ComfyUIBackend(Backend):
         try:
             self._inject_inputs(client, workflow, ctx)
             prompt_id = self._submit(client, workflow, client_id)
-            history = self._poll_history(client, prompt_id)
+            timeout = float(cfg.get("timeout", _POLL_TIMEOUT))
+            history = self._poll_history(client, prompt_id, timeout)
             self._collect_outputs(client, history, ctx)
         except httpx.HTTPError as exc:
             raise ExecutionError(f"ComfyUI request failed: {exc}") from exc
@@ -72,32 +83,52 @@ class ComfyUIBackend(Backend):
                     f"Rule '{ctx.rule_name}': comfyui config injects input '{name}', "
                     f"but the rule declares no such input."
                 )
+            # A list/glob input with `node_prefix` fans across numbered nodes: each file goes
+            # to <prefix>1, <prefix>2, … (e.g. 1-5 reference images into ref1..refN). The
+            # workflow is expected to have exactly as many ref nodes as files (generated to
+            # match), so injection is 1:1.
+            if "node_prefix" in spec:
+                paths = value if isinstance(value, list) else [value]
+                for i, path in enumerate(paths, 1):
+                    node = _node(workflow, f"{spec['node_prefix']}{i}",
+                                 f"input '{name}' #{i}")
+                    self._inject_one(client, node, spec["field"], path, name)
+                continue
             if isinstance(value, list):
                 raise ExecutionError(
-                    f"ComfyUI input '{name}' received a multi-file (grouped) input; "
-                    f"ComfyUI injection supports a single file per input."
+                    f"ComfyUI input '{name}' received a multi-file (grouped) input; set "
+                    f"`node_prefix` to fan it across numbered nodes, or pass a single file."
                 )
             node = _node(workflow, spec["node"], f"input '{name}'")
-            media = infer_media(value)
-            if media == "image":
-                node["inputs"][spec["field"]] = self._upload_image(client, value)
-            elif media in ("text", "data"):
-                node["inputs"][spec["field"]] = value.read_text()
-            else:
-                raise ExecutionError(
-                    f"ComfyUI cannot inject media '{media}' ({value}) for input '{name}'."
-                )
+            self._inject_one(client, node, spec["field"], value, name)
 
-    def _upload_image(self, client: httpx.Client, path: Path) -> str:
+    def _inject_one(self, client, node, field: str, path: "Path", name: str) -> None:
+        media = infer_media(path)
+        if media in ("image", "video", "audio"):
+            node["inputs"][field] = self._upload_file(client, path)
+        elif media in ("text", "data"):
+            node["inputs"][field] = path.read_text()
+        else:
+            raise ExecutionError(
+                f"ComfyUI cannot inject media '{media}' ({path}) for input '{name}'."
+            )
+
+    def _upload_file(self, client: httpx.Client, path: Path) -> str:
+        """Upload a binary input (image / video / audio) to ComfyUI's input dir.
+
+        ComfyUI's ``/upload/image`` endpoint stores any uploaded file under ``input/`` and a
+        Load* node (LoadImage, LoadVideo, LoadAudio) reads it back by name — so the same
+        endpoint serves all of them.
+        """
         data = path.read_bytes()
-        # Content-addressed upload name: ComfyUI's LoadImage caches by filename across
-        # prompts, so reusing a generic name would serve a stale image to later jobs. A
-        # content hash keeps distinct images distinct and dedupes identical ones.
+        # Content-addressed upload name: a Load* node caches by filename across prompts, so
+        # reusing a generic name would serve a stale file to later jobs. A content hash keeps
+        # distinct files distinct and dedupes identical ones.
         name = f"smoketree_{hashlib.sha256(data).hexdigest()[:16]}{path.suffix.lower()}"
         files = {"image": (name, data)}
         resp = client.post("/upload/image", files=files, data={"overwrite": "true"})
         if resp.status_code >= 400:
-            raise ExecutionError(_http_detail(f"upload image '{name}'", resp))
+            raise ExecutionError(_http_detail(f"upload file '{name}'", resp))
         return resp.json()["name"]
 
     def _submit(self, client: httpx.Client, workflow: dict, client_id: str) -> str:
@@ -110,8 +141,10 @@ class ComfyUIBackend(Backend):
             raise ExecutionError(f"ComfyUI did not return a prompt_id: {body}")
         return prompt_id
 
-    def _poll_history(self, client: httpx.Client, prompt_id: str) -> dict:
-        deadline = time.monotonic() + _POLL_TIMEOUT
+    def _poll_history(
+        self, client: httpx.Client, prompt_id: str, timeout: float = _POLL_TIMEOUT
+    ) -> dict:
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             resp = client.get(f"/history/{prompt_id}")
             resp.raise_for_status()
@@ -120,7 +153,8 @@ class ComfyUIBackend(Backend):
                 return history[prompt_id]
             time.sleep(_POLL_INTERVAL)
         raise ExecutionError(
-            f"Timed out after {_POLL_TIMEOUT:.0f}s waiting for ComfyUI prompt {prompt_id}."
+            f"Timed out after {timeout:.0f}s waiting for ComfyUI prompt {prompt_id}. "
+            f"For slow renders (long videos), raise the rule's comfyui `config.timeout`."
         )
 
     def _collect_outputs(
@@ -135,14 +169,15 @@ class ComfyUIBackend(Backend):
                     f"Rule '{ctx.rule_name}': comfyui config has no 'outputs.{name}' "
                     f"collect spec for declared output '{name}'."
                 )
-            node_output = node_outputs.get(spec["node"])
-            images = (node_output or {}).get("images") or []
-            if not images:
+            node_output = node_outputs.get(spec["node"]) or {}
+            files = _output_files(node_output)
+            if not files:
                 raise ExecutionError(
-                    f"ComfyUI node '{spec['node']}' produced no images "
-                    f"(for output '{name}')."
+                    f"ComfyUI node '{spec['node']}' produced no collectable output "
+                    f"(for output '{name}'; saw keys "
+                    f"{', '.join(sorted(node_output)) or 'none'})."
                 )
-            data = self._download(client, images[0])
+            data = self._download(client, files[0])
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
 
@@ -157,6 +192,24 @@ class ComfyUIBackend(Backend):
         )
         resp.raise_for_status()
         return resp.content
+
+
+def _output_files(node_output: dict) -> list:
+    """The list of saved file dicts a node reported, whatever media key it used.
+
+    ComfyUI buckets a node's saved files by media type: ``images`` for stills, but
+    ``videos`` / ``gifs`` for video and animation nodes (e.g. SaveVideo, VHS). Try those in
+    turn, then fall back to any list of file dicts (a ``filename`` entry), so an image and a
+    video output collect through the same path.
+    """
+    for key in ("images", "videos", "gifs", "audio"):
+        files = node_output.get(key)
+        if files:
+            return files
+    for value in node_output.values():
+        if isinstance(value, list) and value and isinstance(value[0], dict) and "filename" in value[0]:
+            return value
+    return []
 
 
 def _node(workflow: dict, node_id: str, context: str) -> dict:

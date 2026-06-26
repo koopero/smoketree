@@ -9,6 +9,9 @@ output — one directory per item. Config:
                    #   one list-valued key, which is used).
     key: <field>   # optional — an item field to slugify into the scatter directory name;
                    #   defaults to the item's zero-based index (e.g. 000, 001, …).
+    protect: <pat> # optional — a path-pattern keyed by the scatter axis (e.g.
+                   #   "concepts/{concept}.md"); an item whose protected file exists is
+                   #   SKIPPED, never overwriting a human-owned (hand-authored) item.
 
 If the output port declares a schema, every item is validated against it before writing.
 """
@@ -64,10 +67,17 @@ class ExplodeBackend(Backend):
         axis = axes[0]
         key_field = ctx.config.get("key")
         schema = ctx.schemas.get(out_name)
+        protect = ctx.config.get("protect")  # path-pattern; items whose file exists are skipped
+        protect_pat = Pattern.compile(protect) if protect else None
 
         used: set[str] = set()
         for index, item in enumerate(items):
             slug = self._slug_for(ctx, item, key_field, index)
+            # Protected slug (a human-authored owner exists): never overwrite it.
+            if protect_pat is not None:
+                owner = ctx.project.root / protect_pat.fill({**ctx.keys, axis: slug})
+                if owner.exists():
+                    continue
             base, n = slug, 2
             while slug in used:  # keep dir names unique within this round
                 slug, n = f"{base}-{n}", n + 1

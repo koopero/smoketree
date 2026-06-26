@@ -32,12 +32,22 @@ export default {
     url() {
       return `${this.card.artifact_url}&t=${this.bust}`;
     },
+    // Small cached thumbnail for the grid (full-res only on click) — avoids decoding many
+    // 1024px+ PNGs at once. /artifact?id=… and /file?path=… both map to /thumb?….
+    thumbUrl() {
+      const t = this.card.artifact_url
+        .replace('/artifact?', '/thumb?')
+        .replace('/file?', '/thumb?');
+      return `${t}&t=${this.bust}`;
+    },
     isText() {
       return this.card.media === 'text' || this.card.media === 'data';
     },
   },
   template: `
-    <img v-if="card.media === 'image'" loading="lazy" :src="url">
+    <a v-if="card.media === 'image'" :href="url" target="_blank" rel="noopener" title="open full size">
+      <img loading="lazy" :src="thumbUrl">
+    </a>
     <video v-else-if="card.media === 'video'" :src="url" controls loop muted playsinline></video>
     <template v-else-if="isText">
       <pre v-if="text !== null">{{ text }}</pre>

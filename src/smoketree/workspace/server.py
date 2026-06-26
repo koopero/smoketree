@@ -13,6 +13,7 @@ the loop in the browser.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import queue
 import threading
 import webbrowser
@@ -27,6 +28,7 @@ from ..errors import SmoketreeError
 from ..project import Project
 from ..rules import load_pipeline
 from .actions import fire_trigger
+from .channels import read_channels
 from .graph import build_graph
 from .index import add_note, build_index, set_select
 
@@ -126,6 +128,40 @@ def _file_url(rel: str) -> str:
     return f"/file?path={quote(rel)}"
 
 
+def _thumbnail(src: Path, cache_dir: Path, max_edge: int = 400) -> "Path | None":
+    """A cached, downscaled JPEG of an image (Pillow). Keyed by the source's mtime+size so a
+    regenerated artifact gets a fresh thumb and an unchanged one is served from cache. Returns
+    None when no thumbnail can be made (not an image, or Pillow unavailable) — the caller then
+    serves the original. This keeps the workspace grid from decoding many full-res PNGs at once
+    (the OOM that could crash a browser tab)."""
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - Pillow is a declared dependency
+        return None
+    try:
+        st = src.stat()
+    except OSError:
+        return None
+    key = hashlib.sha256(
+        f"{src}:{st.st_mtime_ns}:{st.st_size}:{max_edge}".encode()
+    ).hexdigest()[:24]
+    out = cache_dir / f"{key}.jpg"
+    if out.exists():
+        return out
+    try:
+        with Image.open(src) as im:
+            im.thumbnail((max_edge, max_edge))  # downscale-only, preserves aspect
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".tmp")
+            im.save(tmp, format="JPEG", quality=80)
+            tmp.replace(out)  # atomic publish
+    except Exception:
+        return None
+    return out
+
+
 def _flagged(channels) -> bool:
     return any(
         (c.has_note if c.kind == "notes" else c.value != c.default) for c in channels
@@ -200,11 +236,37 @@ def create_app(project: Project, pipeline_id: str):
         raise HTTPException(status_code=404, detail="Unknown output.")
 
     def _find_channel(card_id: str, channel_name: str):
-        card = _find_card(card_id)
-        for channel in card.channels:
-            if channel.name == channel_name:
-                return channel
-        raise HTTPException(status_code=404, detail="Unknown channel.")
+        # Fast path: the rule's output exists, so it's a card in the feedback index.
+        for card in _index():
+            if card.id == card_id:
+                for channel in card.channels:
+                    if channel.name == channel_name:
+                        return channel
+                raise HTTPException(status_code=404, detail="Unknown channel.")
+        # Fallback: a feedback channel is a standalone file, so it's settable even before the
+        # rule has produced its output (e.g. a GATE select shown in the graph view). Resolve
+        # it straight from the rule + keys encoded in the id.
+        channel = _channel_from_id(card_id, channel_name)
+        if channel is not None:
+            return channel
+        raise HTTPException(status_code=404, detail="Unknown output.")
+
+    def _channel_from_id(card_id: str, channel_name: str):
+        """Resolve a feedback channel from a `<rule>:<k=v,…>` id without needing its output."""
+        rule_name, _, keypart = card_id.partition(":")
+        if not rule_name:
+            return None
+        keys = dict(
+            kv.split("=", 1) for kv in keypart.split(",") if "=" in kv
+        )
+        loaded = load_pipeline(Project(root), pipeline_id)
+        rule = next((r for r in loaded.rules if r.name == rule_name), None)
+        if rule is None or not rule.feedback:
+            return None
+        for ch in read_channels(root, rule, keys):
+            if ch.name == channel_name:
+                return ch
+        return None
 
     def _guard_in_project(path) -> None:
         if not str(path.resolve()).startswith(str(project.root.resolve())):
@@ -254,6 +316,27 @@ def create_app(project: Project, pipeline_id: str):
         if not target.is_file():
             raise HTTPException(status_code=404, detail="No such file.")
         return FileResponse(target, media_type=_svg_media(target))
+
+    @app.get("/thumb")
+    def thumb(id: str | None = None, path: str | None = None) -> FileResponse:
+        """A small cached thumbnail of an image artifact (by card id or path) so the grid
+        loads tiny JPEGs instead of many full-res PNGs. Falls back to the original file when
+        it isn't a rasterable image (SVG, etc.)."""
+        if id is not None:
+            src = _find_card(id).output_path
+        elif path is not None:
+            src = (root / path).resolve()
+            if not str(src).startswith(str(project.root.resolve())):
+                raise HTTPException(status_code=400, detail="Refusing path outside project.")
+        else:
+            raise HTTPException(status_code=400, detail="thumb needs an id or path.")
+        if not src.is_file():
+            raise HTTPException(status_code=404, detail="No such file.")
+        thumb_path = _thumbnail(src, project.root / ".smoketree" / "thumbs")
+        if thumb_path is None:  # not a raster image — serve the original
+            return FileResponse(src, media_type=_svg_media(src))
+        return FileResponse(thumb_path, media_type="image/jpeg",
+                            headers={"Cache-Control": "public, max-age=86400"})
 
     @app.post("/api/note")
     def post_note(note: NoteIn) -> JSONResponse:

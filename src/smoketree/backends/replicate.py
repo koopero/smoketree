@@ -7,9 +7,15 @@ Reads its settings from the rule's ``config`` block:
   fields      per-input overrides: {name: {field: <model-field>, array: bool}}
   image_max_edge  downscale cap for image inputs (px long edge)  (optional)
 
-Each input is mapped to a model field by media: text/data -> the file's text, image ->
-a ``data:`` URI. Outputs are taken in declared order from the prediction result and
-written to the rule's declared output paths.
+Each input is mapped to a model field by media: text/data -> the file's text, image /
+audio / video / binary -> a ``data:`` URI. Outputs are taken in declared order from the
+prediction result and written to the rule's declared output paths.
+
+A **scatter** output — an ``out`` port whose path carries a ``{key}`` no input binds (e.g.
+``songs/{song}/stems/{stem}.wav``) — fans the model's structured result across that axis:
+a mapping result keys each file by its name (``{vocals: ..., drums: ...}``), a list result
+names files from their URL basename (falling back to a zero-padded index). A scatter port
+must be the rule's only output.
 
 ``replicate`` is an optional dependency (the ``[replicate]`` extra), imported lazily.
 The API token comes from ``REPLICATE_API_TOKEN``.
@@ -17,6 +23,8 @@ The API token comes from ``REPLICATE_API_TOKEN``.
 
 from __future__ import annotations
 
+import base64
+import mimetypes
 import os
 import re
 import time
@@ -24,6 +32,7 @@ from pathlib import Path
 
 import httpx
 
+from ..bind import Pattern
 from ..errors import ExecutionError
 from ..images import encode_image
 from ..media import infer_media
@@ -45,8 +54,18 @@ class ReplicateBackend(Backend):
 
         inp = self._build_input(ctx)
         output = self._run_prediction(model, inp)
-        items = list(output) if isinstance(output, (list, tuple)) else [output]
 
+        scatter = [name for name in ctx.outputs if self._scatter_axes(ctx, name)]
+        if scatter:
+            if len(ctx.outputs) != 1:
+                raise ExecutionError(
+                    f"Rule '{ctx.rule_name}': scatter replicate output '{scatter[0]}' must be "
+                    f"the rule's only output (a single model result is fanned across it)."
+                )
+            self._write_scatter(ctx, scatter[0], model, output)
+            return
+
+        items = list(output) if isinstance(output, (list, tuple)) else [output]
         for i, (name, target) in enumerate(ctx.outputs.items()):
             if i >= len(items):
                 raise ExecutionError(
@@ -98,9 +117,69 @@ class ReplicateBackend(Backend):
             return f"data:{media_type};base64,{b64}"
         if media in ("text", "data"):
             return path.read_text()
+        if media in ("audio", "video"):
+            return _data_uri(path)
         raise ExecutionError(
             f"Replicate input '{name}' has unsupported media '{media}' ({path})."
         )
+
+    def _scatter_axes(self, ctx: ExecutionContext, name: str) -> list[str]:
+        """Output keys of port ``name`` that no input binds — the scatter axis (or [])."""
+        raw = ctx.out_patterns.get(name)
+        if not raw:
+            return []
+        return [k for k in Pattern.compile(raw).keys if k not in ctx.keys]
+
+    def _write_scatter(self, ctx: ExecutionContext, name: str, model: str, output) -> None:
+        """Fan a single structured model result across the port's one scatter ``{key}``."""
+        axes = self._scatter_axes(ctx, name)
+        if len(axes) != 1:
+            raise ExecutionError(
+                f"Rule '{ctx.rule_name}': scatter replicate output '{name}' must have exactly "
+                f"one scatter {{key}} (an output key no input binds); found {axes or 'none'}."
+            )
+        axis = axes[0]
+        pattern = Pattern.compile(ctx.out_patterns[name])
+        used: set[str] = set()
+        for raw_name, item in self._scatter_items(model, output):
+            slug, base, n = _slug(raw_name), _slug(raw_name), 2
+            while slug in used:  # keep stem names unique within this run
+                slug, n = f"{base}-{n}", n + 1
+            used.add(slug)
+            target = ctx.project.root / pattern.fill({**ctx.keys, axis: slug})
+            data = self._extract(item, target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(data, str):
+                target.write_text(data)
+            else:
+                target.write_bytes(data)
+
+    def _scatter_items(self, model: str, output) -> list[tuple[str, object]]:
+        """Normalise a model result into ``[(stem_name, item), ...]`` for the scatter axis."""
+        if isinstance(output, dict):
+            items = [(str(k), v) for k, v in output.items() if v is not None]
+        elif isinstance(output, (list, tuple)):
+            items = [(self._stem_name(v, i), v) for i, v in enumerate(output)]
+        else:
+            items = [(self._stem_name(output, 0), output)]
+        if not items:
+            raise ExecutionError(
+                f"Replicate model '{model}' returned no outputs to scatter."
+            )
+        return items
+
+    @staticmethod
+    def _stem_name(item, index: int) -> str:
+        """Best-effort name for a list/scalar output item — its URL basename, else index."""
+        url = getattr(item, "url", None)
+        if not isinstance(url, str) and isinstance(item, str):
+            url = item
+        if isinstance(url, str):
+            base = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+            stem = base.rsplit(".", 1)[0]
+            if stem:
+                return stem
+        return f"{index:03d}"
 
     def _run_prediction(self, model: str, inp: dict):
         token = os.environ.get("REPLICATE_API_TOKEN")
@@ -148,6 +227,18 @@ class ReplicateBackend(Backend):
         raise ExecutionError(
             f"Don't know how to read a Replicate output of type '{type(item).__name__}'."
         )
+
+
+def _slug(value: object) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+    return s or "item"
+
+
+def _data_uri(path: Path) -> str:
+    """A ``data:`` URI for a binary input (audio/video/…); Replicate uploads it for us."""
+    media_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    b64 = base64.standard_b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{media_type};base64,{b64}"
 
 
 def _is_throttle(exc: Exception) -> bool:

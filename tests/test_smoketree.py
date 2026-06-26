@@ -1177,6 +1177,81 @@ def test_workspace_server_select_and_note(tmp_path: Path):
     assert client.get("/api/index").json()["cards"][0]["flagged"] is True
 
 
+def test_workspace_select_settable_before_output_exists(tmp_path: Path):
+    """A gate select is settable from the graph view even before the rule has run.
+
+    The rule's output (pick.json) doesn't exist yet, so there is no feedback *card* — but
+    the select is a standalone file, so /api/select resolves it straight from rule + keys.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from smoketree.workspace.server import create_app
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: pick\n"
+        '    in:\n      go: "in/{k}.txt"\n'
+        '    out:\n      picked: "out/{k}/pick.json"\n'
+        '    run: "cp {go} {picked}"\n'
+        "    feedback:\n"
+        "      - name: use\n"
+        '        path: "out/{k}/use.yaml"\n'
+        "        kind: select\n"
+        "        options: [skip, use]\n",
+    )
+    write(tmp_path, "in/alpha.txt", "go\n")
+    # Deliberately do NOT run — pick.json is absent, so there is no card.
+
+    client = TestClient(create_app(project, "g"))
+    assert client.get("/api/index").json()["cards"] == []  # no card (output missing)
+
+    # The select still resolves and writes, via rule+keys in the id (the bug: used to 404).
+    r = client.post("/api/select", json={"id": "pick:k=alpha", "channel": "use", "value": "use"})
+    assert r.status_code == 200 and r.json()["value"] == "use"
+    assert (tmp_path / "out/alpha/use.yaml").read_text().strip().endswith("use: use")
+
+    # a genuinely unknown rule/channel still 404s
+    assert client.post("/api/select",
+                       json={"id": "nope:k=alpha", "channel": "use", "value": "use"}).status_code == 404
+
+
+def test_workspace_thumbnail_downscales_image(tmp_path: Path):
+    """/thumb serves a small cached JPEG so the grid doesn't decode many full-res PNGs."""
+    pytest.importorskip("fastapi")
+    pil = pytest.importorskip("PIL.Image")
+    from io import BytesIO
+
+    from fastapi.testclient import TestClient
+
+    from smoketree.workspace.server import create_app
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: noop\n"
+        '    in:\n      a: "x/{k}.txt"\n'
+        '    out:\n      b: "y/{k}.txt"\n'
+        '    run: "cp {a} {b}"\n',
+    )
+    big = tmp_path / "pics/hero.png"
+    big.parent.mkdir(parents=True)
+    pil.new("RGB", (1200, 900), (20, 40, 80)).save(big)
+
+    client = TestClient(create_app(project, "g"))
+    full = client.get("/file?path=pics/hero.png")
+    thumb = client.get("/thumb?path=pics/hero.png")
+
+    assert thumb.status_code == 200
+    assert thumb.headers["content-type"].startswith("image/jpeg")
+    assert len(thumb.content) < len(full.content)            # much smaller payload
+    assert max(pil.open(BytesIO(thumb.content)).size) <= 400  # downscaled
+    assert (tmp_path / ".smoketree/thumbs").is_dir()         # cached on disk
+    # a path outside the project is refused
+    assert client.get("/thumb?path=../escape.png").status_code == 400
+
+
 # --------------------------------------------------------------------------- #
 # Trigger (declarative "generate more") + artifact graph + dashboard API
 # --------------------------------------------------------------------------- #
@@ -1416,6 +1491,30 @@ def test_explode_backend_fans_list_into_dirs(tmp_path: Path):
     assert json.loads(jay.read_text())["n"] == 2
 
 
+def test_explode_protect_skips_human_owned_slug(tmp_path: Path):
+    """An item whose `protect` file exists is left alone — a hand-authored item wins."""
+    import json
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: explode\n"
+        '    in:\n      list: "in/items.json"\n'
+        '    out:\n      item: "out/{slug}/item.json"\n'
+        "    backend: explode\n"
+        "    config: { items: things, key: name, protect: 'authored/{slug}.md' }\n",
+    )
+    write(tmp_path, "in/items.json",
+          '{"things": [{"name": "Red Fox", "n": 1}, {"name": "blue jay", "n": 2}]}')
+    write(tmp_path, "authored/red-fox.md", "human owns this one")  # protected
+    write(tmp_path, "out/red-fox/item.json", '{"n": 99, "human": true}')  # pre-existing
+    run(project)
+
+    # red-fox is protected -> untouched; blue-jay (no owner) is written normally.
+    assert json.loads((tmp_path / "out/red-fox/item.json").read_text())["n"] == 99
+    assert json.loads((tmp_path / "out/blue-jay/item.json").read_text())["n"] == 2
+
+
 def test_explode_backend_indexes_when_no_key(tmp_path: Path):
     project = make_project(
         tmp_path,
@@ -1627,6 +1726,126 @@ def test_replicate_backend_runs_via_engine(tmp_path: Path, monkeypatch):
     assert (tmp_path / "work/alpha/portrait.png").read_bytes() == b"IMGBYTES"
 
 
+def test_replicate_scatter_fans_named_result_across_stem_axis(tmp_path: Path, monkeypatch):
+    """A {stem} key no input binds fans one model call into one wav per named stem."""
+    import sys
+    import types
+
+    fake = types.ModuleType("replicate")
+    captured: dict = {}
+
+    class FakeClient:
+        def __init__(self, api_token=None):
+            pass
+
+        def run(self, model, input):
+            captured.update(input)
+            # A demucs-style mapping result: one file per named stem.
+            return {"vocals": b"VOX", "drums": b"DRM", "bass": b"BAS", "other": b"OTH"}
+
+    fake.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: song_stems\n    backend: replicate\n"
+        '    in:\n      song: "songs/{song}/source.mp3"\n'
+        '    out:\n      stems: "songs/{song}/stems/{stem}.wav"\n'
+        "    config:\n      model: owner/stems\n",
+    )
+    write(tmp_path, "songs/mai-tai/source.mp3", "ID3FAKEMP3")
+    executed = run(project)
+
+    assert executed == 1
+    stems = tmp_path / "songs/mai-tai/stems"
+    assert (stems / "vocals.wav").read_bytes() == b"VOX"
+    assert (stems / "drums.wav").read_bytes() == b"DRM"
+    assert (stems / "bass.wav").read_bytes() == b"BAS"
+    assert (stems / "other.wav").read_bytes() == b"OTH"
+    # The mp3 went up as an audio data URI, not raw text.
+    assert captured["song"].startswith("data:audio/mpeg;base64,")
+    # Idempotent: the scatter rule does not re-run once its stems exist.
+    assert run(project) == 0
+
+
+def test_replicate_scatter_names_list_result_from_url_basename(tmp_path: Path, monkeypatch):
+    """A list result names each file from its URL basename, falling back to an index."""
+    import sys
+    import types
+
+    class FakeFile:
+        def __init__(self, url, data):
+            self.url = url
+            self._data = data
+
+        def read(self):
+            return self._data
+
+    fake = types.ModuleType("replicate")
+
+    class FakeClient:
+        def __init__(self, api_token=None):
+            pass
+
+        def run(self, model, input):
+            return [
+                FakeFile("https://replicate.delivery/x/bass.wav", b"BAS"),
+                FakeFile("https://replicate.delivery/x/other.wav?token=1", b"OTH"),
+            ]
+
+    fake.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: song_stems\n    backend: replicate\n"
+        '    in:\n      song: "songs/{song}/source.wav"\n'
+        '    out:\n      stems: "songs/{song}/stems/{stem}.wav"\n'
+        "    config:\n      model: owner/stems\n",
+    )
+    write(tmp_path, "songs/track/source.wav", "RIFFFAKEWAV")
+    run(project)
+    stems = tmp_path / "songs/track/stems"
+    assert (stems / "bass.wav").read_bytes() == b"BAS"
+    assert (stems / "other.wav").read_bytes() == b"OTH"  # query string stripped from name
+
+
+def test_replicate_scatter_must_be_sole_output(tmp_path: Path, monkeypatch):
+    import sys
+    import types
+
+    fake = types.ModuleType("replicate")
+
+    class FakeClient:
+        def __init__(self, api_token=None):
+            pass
+
+        def run(self, model, input):
+            return {"vocals": b"VOX"}
+
+    fake.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: song_stems\n    backend: replicate\n"
+        '    in:\n      song: "songs/{song}/source.mp3"\n'
+        "    out:\n"
+        '      stems: "songs/{song}/stems/{stem}.wav"\n'
+        '      mix: "songs/{song}/mix.wav"\n'
+        "    config:\n      model: owner/stems\n",
+    )
+    write(tmp_path, "songs/s/source.mp3", "ID3")
+    with pytest.raises(ExecutionError, match="only output"):
+        run(project)
+
+
 def test_claude_backend_runs_via_engine(tmp_path: Path, monkeypatch):
     import sys
     import types
@@ -1748,6 +1967,242 @@ def test_comfyui_backend_runs_via_engine(tmp_path: Path, monkeypatch):
     wf = submitted["workflow"]
     assert wf["6"]["inputs"]["text"] == "a prompt body"  # text input injected
     assert isinstance(wf["3"]["inputs"]["seed"], int)  # deterministic seed injected
+
+
+def test_comfyui_collects_video_output(tmp_path: Path, monkeypatch):
+    """A video node reports its file under 'videos' (not 'images'); collect it anyway."""
+
+    class FakeResp:
+        def __init__(self, *, status_code=200, payload=None, content=b""):
+            self.status_code = status_code
+            self._payload = payload
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, json=None, files=None, data=None):
+            return FakeResp(payload={"prompt_id": "pid"})
+
+        def get(self, url, params=None):
+            if url == "/history/pid":
+                return FakeResp(
+                    payload={"pid": {"outputs": {"114": {"videos": [{"filename": "clip.mp4"}]}}}}
+                )
+            if url == "/view":
+                return FakeResp(content=b"MP4BYTES")
+            raise AssertionError(url)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("smoketree.backends.comfyui.httpx.Client", FakeClient)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: vid\n    backend: comfyui\n"
+        '    in:\n      text: "sources/{m}/p.txt"\n'
+        '    out:\n      clip: "work/{m}/clip.mp4"\n'
+        "    config:\n"
+        '      workflow: "wf.json"\n'
+        "      seed_inject: {node: \"3\", field: noise_seed}\n"
+        "      inputs:\n        text: {node: \"6\", field: text}\n"
+        "      outputs:\n        clip: {node: \"114\"}\n",
+    )
+    write(tmp_path, "wf.json",
+          '{"3": {"inputs": {"noise_seed": 0}}, "6": {"inputs": {"text": ""}}, '
+          '"114": {"inputs": {}}}')
+    write(tmp_path, "sources/alpha/p.txt", "make it move")
+    run(project)
+
+    assert (tmp_path / "work/alpha/clip.mp4").read_bytes() == b"MP4BYTES"
+
+
+def test_comfyui_uploads_video_input(tmp_path: Path, monkeypatch):
+    """A video input (e.g. for upscaling) is uploaded and its name set on a LoadVideo field."""
+    uploaded = {}
+
+    class FakeResp:
+        def __init__(self, *, status_code=200, payload=None, content=b""):
+            self.status_code = status_code
+            self._payload = payload
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, json=None, files=None, data=None):
+            if url == "/upload/image":
+                uploaded["name"] = files["image"][0]  # server-side filename
+                uploaded["bytes"] = files["image"][1]
+                return FakeResp(payload={"name": files["image"][0]})
+            if url == "/prompt":
+                uploaded["workflow"] = json["prompt"]
+                return FakeResp(payload={"prompt_id": "pid"})
+            raise AssertionError(url)
+
+        def get(self, url, params=None):
+            if url == "/history/pid":
+                return FakeResp(payload={"pid": {"outputs": {"12": {"videos": [{"filename": "up.mp4"}]}}}})
+            if url == "/view":
+                return FakeResp(content=b"UPSCALED")
+            raise AssertionError(url)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("smoketree.backends.comfyui.httpx.Client", FakeClient)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: up\n    backend: comfyui\n"
+        '    in:\n      clip: "work/{m}/in.mp4"\n'
+        '    out:\n      big: "work/{m}/out.mp4"\n'
+        "    config:\n"
+        '      workflow: "wf.json"\n'
+        "      inputs:\n        clip: {node: \"9\", field: file}\n"
+        "      outputs:\n        big: {node: \"12\"}\n",
+    )
+    write(tmp_path, "wf.json", '{"9": {"inputs": {"file": ""}}, "12": {"inputs": {}}}')
+    (tmp_path / "work/alpha").mkdir(parents=True)
+    (tmp_path / "work/alpha/in.mp4").write_bytes(b"RAWCLIP")
+    run(project)
+
+    assert uploaded["bytes"] == b"RAWCLIP"                       # the video was uploaded
+    assert uploaded["workflow"]["9"]["inputs"]["file"] == uploaded["name"]  # name wired in
+    assert (tmp_path / "work/alpha/out.mp4").read_bytes() == b"UPSCALED"
+
+
+def test_comfyui_fans_list_input_across_numbered_nodes(tmp_path: Path, monkeypatch):
+    """A glob (list) image input with node_prefix injects each file into ref1, ref2, …."""
+    seen = {}
+
+    class FakeResp:
+        def __init__(self, *, status_code=200, payload=None, content=b""):
+            self.status_code = status_code
+            self._payload = payload
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, json=None, files=None, data=None):
+            if url == "/upload/image":
+                return FakeResp(payload={"name": files["image"][0]})
+            if url == "/prompt":
+                seen["wf"] = json["prompt"]
+                return FakeResp(payload={"prompt_id": "pid"})
+            raise AssertionError(url)
+
+        def get(self, url, params=None):
+            if url == "/history/pid":
+                return FakeResp(payload={"pid": {"outputs": {"save": {"images": [{"filename": "o.png"}]}}}})
+            if url == "/view":
+                return FakeResp(content=b"FRAME")
+            raise AssertionError(url)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("smoketree.backends.comfyui.httpx.Client", FakeClient)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: refframe\n    backend: comfyui\n"
+        '    in:\n      refs: "refs/{m}/*.png"\n'
+        '    out:\n      frame: "work/{m}/frame.png"\n'
+        "    config:\n"
+        '      workflow: "wf.json"\n'
+        "      inputs:\n        refs: {node_prefix: ref, field: image}\n"
+        "      outputs:\n        frame: {node: save}\n",
+    )
+    write(tmp_path, "wf.json",
+          '{"ref1": {"class_type": "LoadImage", "inputs": {"image": ""}}, '
+          '"ref2": {"class_type": "LoadImage", "inputs": {"image": ""}}, '
+          '"save": {"inputs": {}}}')
+    (tmp_path / "refs/alpha").mkdir(parents=True)
+    (tmp_path / "refs/alpha/a.png").write_bytes(b"REFA")
+    (tmp_path / "refs/alpha/b.png").write_bytes(b"REFB")
+    run(project)
+
+    wf = seen["wf"]
+    # two distinct files landed in ref1 and ref2 (content-addressed upload names differ)
+    assert wf["ref1"]["inputs"]["image"] and wf["ref2"]["inputs"]["image"]
+    assert wf["ref1"]["inputs"]["image"] != wf["ref2"]["inputs"]["image"]
+    assert (tmp_path / "work/alpha/frame.png").read_bytes() == b"FRAME"
+
+
+def test_comfyui_interpolates_keys_in_workflow_path(tmp_path: Path, monkeypatch):
+    """A `{key}` in the workflow path resolves per binding (a generated per-song workflow)."""
+
+    class FakeResp:
+        def __init__(self, *, status_code=200, payload=None, content=b""):
+            self.status_code = status_code
+            self._payload = payload
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, json=None, files=None, data=None):
+            return FakeResp(payload={"prompt_id": "pid"})
+
+        def get(self, url, params=None):
+            if url == "/history/pid":
+                return FakeResp(payload={"pid": {"outputs": {"save": {"images": [{"filename": "o.png"}]}}}})
+            return FakeResp(content=b"OUT")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("smoketree.backends.comfyui.httpx.Client", FakeClient)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: gen\n    backend: comfyui\n"
+        '    in:\n      go: "work/{m}/go.txt"\n'
+        '    out:\n      frame: "work/{m}/frame.png"\n'
+        "    config:\n"
+        '      workflow: "work/{m}/wf.json"\n'      # per-binding workflow path
+        "      outputs:\n        frame: {node: save}\n",
+    )
+    write(tmp_path, "work/alpha/go.txt", "go")
+    write(tmp_path, "work/alpha/wf.json", '{"save": {"inputs": {}}}')  # only alpha's exists
+    run(project)
+
+    assert (tmp_path / "work/alpha/frame.png").read_bytes() == b"OUT"
 
 
 # --------------------------------------------------------------------------- #
