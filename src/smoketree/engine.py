@@ -231,14 +231,21 @@ def _inputs_present(binding: Binding) -> bool:
     return True
 
 
-def _staleness(binding: Binding, state: State) -> tuple[bool, str]:
+def _staleness(binding: Binding, state: State, exist_only: bool = False) -> tuple[bool, str]:
     """Return (is_stale, reason).
 
     A cheap mtime+size fingerprint gates the content hash: an unchanged fingerprint
     means up-to-date without re-reading inputs. A moved fingerprint falls through to
     the content hash — if the contents are in fact identical (e.g. a touched file),
     the stored fingerprint is refreshed so the next pass is cheap again.
+
+    With ``exist_only`` the recorded state and input hashes are ignored entirely: a binding
+    is up to date iff all its (enumerable) outputs already exist on disk — i.e. run only what
+    is missing, regardless of whether inputs changed.
     """
+    if exist_only:
+        missing = [p for p in binding.enumerable_outputs if not p.exists()]
+        return (True, "output missing") if missing else (False, "exists")
     record = state.get(binding.identity)
     if record is None:
         return True, "new"
@@ -340,9 +347,17 @@ def _execute(project: Project, binding: Binding, report: Reporter) -> None:
 
 
 def _filter_pass(binding: Binding) -> bool:
-    """Whether ``binding`` passes its rule's filter predicate (reads an input data file)."""
+    """Whether ``binding`` passes its rule's filter predicate (reads an input data file).
+
+    The predicate input may be a regular input or an ambient ``context`` input — the latter
+    lets a non-shell rule gate on a data field without also feeding that file to its backend
+    (e.g. a replicate rule routed by a sibling ``clip_plan.json`` it must not send to the model).
+    """
     spec = binding.rule.filter
     value = binding.inputs.get(spec.input)
+    if value is None:
+        ctx = binding.context.get(spec.input)
+        value = ctx[0] if ctx else None
     if not isinstance(value, Path) or not value.is_file():
         return False
     data = load_data(value)
@@ -423,6 +438,7 @@ def run(
     force: bool = False,
     only: set[str] | None = None,
     where: dict[str, str] | None = None,
+    exist_only: bool = False,
     report: Reporter = lambda _: None,
 ) -> int:
     """Run the pipeline to fixpoint. Returns the number of jobs executed.
@@ -459,7 +475,7 @@ def run(
                     state.save()
                     progressed = True
                 continue
-            stale, reason = _staleness(binding, state)
+            stale, reason = _staleness(binding, state, exist_only)
             if not stale:
                 continue
             report(f"[run ] {binding.identity}  ({reason})")
@@ -497,6 +513,7 @@ def compute_plan(
     force: bool = False,
     only: set[str] | None = None,
     where: dict[str, str] | None = None,
+    exist_only: bool = False,
 ) -> list[PlanEntry]:
     """A single-pass dry run: current runnable bindings + rules still waiting on inputs."""
     _check_only(loaded, only)
@@ -521,7 +538,7 @@ def compute_plan(
             if force:
                 entries.append(PlanEntry(binding.identity, "RUN", "forced"))
                 continue
-            stale, reason = _staleness(binding, state)
+            stale, reason = _staleness(binding, state, exist_only)
             entries.append(
                 PlanEntry(binding.identity, "RUN" if stale else "SKIP", reason)
             )

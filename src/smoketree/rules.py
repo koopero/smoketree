@@ -14,7 +14,6 @@ from pydantic import ValidationError as PydanticValidationError
 
 from .bind import Pattern, _VAR
 from .errors import ValidationError
-from .loader import load_yaml
 from .models import Pipeline, Rule
 from .project import Project
 
@@ -35,14 +34,19 @@ class LoadedPipeline:
         return self.pipeline.name
 
 
-def load_pipeline(project: Project, pipeline_id: str) -> LoadedPipeline:
-    """Load, parse, and validate a pipeline. Raises :class:`ValidationError`."""
-    path = project.graph_path(pipeline_id)
-    data = load_yaml(path)
+def load_pipeline(project: Project) -> LoadedPipeline:
+    """Resolve and validate the project's graph. Raises :class:`ValidationError`.
+
+    The graph (``models:`` + ``rules:``) lives in ``smoketree.yaml``, already parsed into
+    ``project.config``; its identity is the project name.
+    """
+    pipeline_id = project.config.name
     try:
-        pipeline = Pipeline.model_validate(data)
+        pipeline = project.config.as_pipeline()
     except PydanticValidationError as exc:
-        raise ValidationError(f"Invalid pipeline '{pipeline_id}' ({path}):\n{exc}") from exc
+        raise ValidationError(
+            f"Invalid project graph in smoketree.yaml ('{pipeline_id}'):\n{exc}"
+        ) from exc
 
     _resolve_models(pipeline_id, pipeline)
     _validate(pipeline_id, pipeline)
@@ -118,10 +122,10 @@ def _validate(pipeline_id: str, pipeline: Pipeline) -> None:
                 f"{', '.join(sorted(ports)) or '(none)'}."
             )
 
-        if rule.filter is not None and rule.filter.input not in rule.in_:
+        if rule.filter is not None and rule.filter.input not in (set(rule.in_) | set(rule.context)):
             raise ValidationError(
                 f"Rule '{rule.name}': filter.input '{rule.filter.input}' is not a declared "
-                f"input. Inputs: {', '.join(sorted(rule.in_)) or '(none)'}."
+                f"input or context. Inputs: {', '.join(sorted(rule.in_)) or '(none)'}."
             )
 
         unknown_author = set(rule.author) - set(rule.out)

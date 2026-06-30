@@ -11,19 +11,18 @@ changed (content-hash staleness).
 ## Project layout
 
 ```
-smoketree.yaml          project config (name, defaults)
-graphs/<id>.yaml        a pipeline: a name + a list of rules
+smoketree.yaml          the project: name, defaults, and the graph (models + rules)
 scripts/                helper scripts your rule commands call
 sources/                your authored inputs
 .smoketree/state/       recorded input hashes (the cache); safe to delete
 ```
 
-Run a pipeline named `demo` (file `graphs/demo.yaml`) with `smoketree run demo`.
+A project is a single graph: `smoketree.yaml` holds the rules. Run it with `smoketree run`.
 
 ## Rules
 
-A pipeline file is `{ name, models?: {...}, rules: [...] }` (see **Named models** for the
-optional `models:` block). Each rule:
+`smoketree.yaml` holds `{ name, defaults?, models?: {...}, rules: [...] }` (see **Named
+models** for the optional `models:` block). Each rule:
 
 ```yaml
 - name: shout
@@ -86,7 +85,7 @@ rules at it with `model: <name>`, instead of repeating `backend` + `config` on e
 name: g
 models:
   writer:  { backend: openai, model: gpt-5.1, max_tokens: 8000 }
-  renderer: { backend: comfyui, workflow: graphs/comfyui/txt2img.json }
+  renderer: { backend: comfyui, workflow: workflows/txt2img.json }
 rules:
   - name: narrative
     in:  { brief: "sources/brief.txt" }
@@ -171,7 +170,7 @@ compiles notes into a directive the prompt consumes, closing the loop:
       └──────────── human edits the note (workspace or editor) ◄─┘
 ```
 
-`smoketree workspace <id>` serves a local gallery of every rendered output that has any
+`smoketree workspace` serves a local gallery of every rendered output that has any
 `feedback:` channel — a notes box or a select control per channel (with its `describe`),
 saving to the channel file.
 
@@ -256,7 +255,7 @@ absent; that copy is **yours** — never clobbered, and the file downstream cons
 - `purge` removes the template, not your copy.
 
 **Reconcile.** When the generator's inputs change, its template moves away from the
-fork-base (the template content when you forked). `smoketree reconcile <id>` lists those
+fork-base (the template content when you forked). `smoketree reconcile` lists those
 *drifted* copies; resolve each with `--merge` (3-way merge the generated changes into your
 copy — text, conflict markers on overlap), `--take-generated`, or `--keep-mine`. Each
 clears the drift by advancing the fork-base. The workspace shows drift with a diff and the
@@ -282,7 +281,7 @@ value folds into **both** the staleness hash (so bumping it re-runs just that ce
 **seed** (so a seeded backend produces a *different* result, not the same image). Roll `0`
 (the default) reproduces today's seed exactly — nothing changes until you actually re-roll.
 
-- `smoketree reroll <id> -w m=alice` bumps the matched cells and re-renders them.
+- `smoketree reroll -w m=alice` bumps the matched cells and re-renders them.
 - In the workspace, reviewable outputs of a `reroll` rule get a **🎲 re-roll** button.
 - Seedless backends (nano-banana, claude) need no seed — the counter still forces the
   re-run, and the model's own nondeterminism supplies the variation.
@@ -294,16 +293,16 @@ value folds into **both** the staleness hash (so bumping it re-runs just that ce
 
 ```
 smoketree init -t demo        # scaffold a runnable example
-smoketree validate <id>       # parse + show inferred order
-smoketree plan <id>           # dry run: what would build now
-smoketree run <id>            # run to fixpoint
-smoketree run <id> --force    # rebuild everything
-smoketree run <id> -r brainstorm           # only this rule (repeatable)
-smoketree run <id> -w run=r2 -w idea=sunset # only bindings matching these keys
-smoketree status <id>         # last-run state
-smoketree reconcile <id>      # list authored copies whose template drifted
-smoketree reconcile <id> --merge   # 3-way merge generated changes into your copies
-smoketree reroll <id> -w m=alice   # fresh take of a generative cell (reroll: true rules)
-smoketree workspace <id>      # human-in-the-loop feedback + reconcile UI (needs [workspace] extra)
-smoketree purge <id>          # delete managed outputs + state
+smoketree validate            # parse + show inferred order
+smoketree plan                # dry run: what would build now
+smoketree run                 # run to fixpoint
+smoketree run --force         # rebuild everything
+smoketree run -r brainstorm           # only this rule (repeatable)
+smoketree run -w run=r2 -w idea=sunset # only bindings matching these keys
+smoketree status              # last-run state
+smoketree reconcile           # list authored copies whose template drifted
+smoketree reconcile --merge   # 3-way merge generated changes into your copies
+smoketree reroll -w m=alice   # fresh take of a generative cell (reroll: true rules)
+smoketree workspace           # human-in-the-loop feedback + reconcile UI (needs [workspace] extra)
+smoketree purge               # delete managed outputs + state
 ```

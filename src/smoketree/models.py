@@ -33,14 +33,6 @@ class Defaults(BaseModel):
     max_iterations: int = 100
 
 
-class ProjectConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    defaults: Defaults = Field(default_factory=Defaults)
-    env: dict[str, str] = Field(default_factory=dict)
-
-
 # --------------------------------------------------------------------------- #
 # Pipeline definition (rules)
 # --------------------------------------------------------------------------- #
@@ -197,6 +189,11 @@ class Rule(BaseModel):
     # generator consider existing artifacts (an ignore list) without depending on them —
     # the way to read your own output without a fixpoint cycle.
     context: dict[str, str] = Field(default_factory=dict)
+    # input names that DON'T gate the binding: an optional input matching nothing binds to
+    # an empty list instead of dropping the rule (a left-join, not the default inner-join).
+    # Always list-shaped, so the backend sees [] when absent. Lets one rule express "use a
+    # reference if one exists, else go reference-less" (i2i-or-txt2img) without a script.
+    optional: list[str] = Field(default_factory=list)
     # reference a named def from the pipeline's `models:` block: pulls in its backend and
     # merges its config under this rule's `config` (rule keys win). Mutually exclusive with
     # `backend` — the def supplies the backend. Resolved away at load time (see rules.py).
@@ -235,6 +232,15 @@ class Rule(BaseModel):
     # next round (the workspace shows a "Generate more" button). See TriggerSpec.
     trigger: TriggerSpec | None = None
 
+    @model_validator(mode="after")
+    def _check_optional(self) -> "Rule":
+        unknown = [n for n in self.optional if n not in self.in_]
+        if unknown:
+            raise ValueError(
+                f"rule '{self.name}': optional names {unknown} are not declared inputs."
+            )
+        return self
+
 
 class Pipeline(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -243,6 +249,31 @@ class Pipeline(BaseModel):
     # named model defs referenced by rules' `model:` field, resolved at load time.
     models: dict[str, ModelDef] = Field(default_factory=dict)
     rules: list[Rule] = Field(default_factory=list)
+
+
+class ProjectConfig(BaseModel):
+    """A project's ``smoketree.yaml``: its config and its graph in one file.
+
+    ``models`` and ``rules`` live here directly, alongside ``name``/``defaults``.
+    They are held raw and validated into a :class:`Pipeline` lazily by ``load_pipeline``,
+    so merely opening a project never fails on a graph error; the graph is validated when
+    you load or run it (the ``smoketree validate`` contract).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    defaults: Defaults = Field(default_factory=Defaults)
+    env: dict[str, str] = Field(default_factory=dict)
+    # Raw graph definition — validated lazily (see as_pipeline).
+    models: dict[str, Any] = Field(default_factory=dict)
+    rules: list[Any] = Field(default_factory=list)
+
+    def as_pipeline(self) -> Pipeline:
+        """Validate the raw graph fields into a Pipeline (may raise pydantic ValidationError)."""
+        return Pipeline.model_validate(
+            {"name": self.name, "models": self.models, "rules": self.rules}
+        )
 
 
 # --------------------------------------------------------------------------- #

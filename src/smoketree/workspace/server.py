@@ -227,7 +227,7 @@ def create_app(project: Project, pipeline_id: str):
     root = project.root
 
     def _index():
-        return build_index(Project(root), pipeline_id)
+        return build_index(Project(root))
 
     def _find_card(card_id: str):
         for card in _index():
@@ -259,7 +259,7 @@ def create_app(project: Project, pipeline_id: str):
         keys = dict(
             kv.split("=", 1) for kv in keypart.split(",") if "=" in kv
         )
-        loaded = load_pipeline(Project(root), pipeline_id)
+        loaded = load_pipeline(Project(root))
         rule = next((r for r in loaded.rules if r.name == rule_name), None)
         if rule is None or not rule.feedback:
             return None
@@ -362,7 +362,7 @@ def create_app(project: Project, pipeline_id: str):
     @app.get("/api/drift")
     def api_drift() -> JSONResponse:
         try:
-            loaded = load_pipeline(Project(root), pipeline_id)
+            loaded = load_pipeline(Project(root))
             drifts = reconcilelib.find_drift(Project(root), loaded)
         except SmoketreeError as exc:
             return JSONResponse({"drift": [], "error": str(exc)})
@@ -384,7 +384,7 @@ def create_app(project: Project, pipeline_id: str):
 
     @app.post("/api/trigger")
     def post_trigger(req: TriggerIn) -> JSONResponse:
-        loaded = load_pipeline(Project(root), pipeline_id)
+        loaded = load_pipeline(Project(root))
         rule = next((r for r in loaded.rules if r.name == req.rule), None)
         if rule is None:
             raise HTTPException(status_code=404, detail="Unknown rule.")
@@ -398,7 +398,7 @@ def create_app(project: Project, pipeline_id: str):
 
     @app.post("/api/reconcile")
     def post_reconcile(req: ReconcileIn) -> JSONResponse:
-        loaded = load_pipeline(Project(root), pipeline_id)
+        loaded = load_pipeline(Project(root))
         for drift in reconcilelib.find_drift(Project(root), loaded):
             if str(drift.authored.relative_to(root)) == req.id:
                 _guard_in_project(drift.authored)
@@ -424,7 +424,7 @@ def create_app(project: Project, pipeline_id: str):
                 from ..rules import load_pipeline
 
                 p = Project(root)
-                loaded = load_pipeline(p, pipeline_id)
+                loaded = load_pipeline(p)
                 engine.run(p, loaded, only=only, where=where,
                            report=lambda line: q.put(str(line)))
                 q.put("[OK] run complete")

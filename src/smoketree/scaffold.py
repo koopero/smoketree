@@ -14,7 +14,7 @@ from pathlib import Path
 from .errors import SmoketreeError
 
 _NAME_TOKEN = "__PROJECT_NAME__"
-_STANDARD_DIRS = ("graphs", "sources", "scripts")
+_STANDARD_DIRS = ("sources", "scripts")
 
 
 def _instructions() -> str:
@@ -39,13 +39,13 @@ defaults:
 # --------------------------------------------------------------------------- #
 # demo: media-breakdown-lite — scatter -> map -> pool -> pool
 # --------------------------------------------------------------------------- #
-
-_DEMO_PIPELINE = """\
-name: demo
-
-# A path-based pipeline. The DAG is inferred from how output patterns feed input
+# The graph lives in smoketree.yaml itself (project == graph): `rules:` sits beside
+# `name:`/`defaults:`. The DAG is inferred from how output patterns feed input
 # patterns; fan-out comes from the {key} axes discovered by globbing the tree.
 # Quote any pattern containing {braces} so YAML doesn't read it as a flow mapping.
+
+_DEMO_RULES = """\
+
 rules:
   # scatter: split each episode's lines into one segment dir per line. The {segment}
   # key is introduced by the output and discovered at runtime, so {segments} resolves
@@ -121,8 +121,7 @@ TEMPLATES: dict[str, Template] = {
     "demo": Template(
         "Offline shell pipeline: scatter -> map -> pool -> pool (no API keys).",
         {
-            "smoketree.yaml": _CONFIG,
-            "graphs/demo.yaml": _DEMO_PIPELINE,
+            "smoketree.yaml": _CONFIG + _DEMO_RULES,
             "scripts/split.py": _SPLIT_PY,
             "sources/episode/ep01/lines.txt": _EP01,
             "sources/episode/ep02/lines.txt": _EP02,

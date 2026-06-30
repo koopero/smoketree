@@ -81,39 +81,31 @@ def init(
     )
     for path in created:
         typer.echo(f"  + {path.relative_to(root)}")
-    nxt = "smoketree run demo" if template == "demo" else "add a pipeline in graphs/"
+    nxt = "smoketree run" if template == "demo" else "add rules to smoketree.yaml"
     typer.echo(f"\nNext:  {nxt}")
 
 
 @app.command()
-def validate(
-    pipeline: Optional[str] = typer.Argument(None, help="Pipeline (default: all)."),
-) -> None:
-    """Validate pipeline definitions (no execution)."""
+def validate() -> None:
+    """Validate the project graph (no execution)."""
     project = _project()
-    ids = [pipeline] if pipeline else project.list_graphs()
-    if not ids:
-        typer.echo("No pipelines found.")
-        return
-    ok = True
-    for pid in ids:
-        try:
-            loaded = load_pipeline(project, pid)
-        except SmoketreeError as exc:
-            ok = False
-            typer.secho(f"[FAIL]  {pid}", fg=typer.colors.RED)
-            typer.echo(f"        {exc}")
-            continue
-        typer.secho(f"[OK]    {pid}", fg=typer.colors.GREEN)
-        typer.echo(f"        {' -> '.join(execution_order(loaded))}")
-    if not ok:
+    try:
+        loaded = load_pipeline(project)
+    except SmoketreeError as exc:
+        typer.secho(f"[FAIL]  {project.config.name}", fg=typer.colors.RED)
+        typer.echo(f"        {exc}")
         raise typer.Exit(code=1)
+    typer.secho(f"[OK]    {loaded.id}", fg=typer.colors.GREEN)
+    typer.echo(f"        {' -> '.join(execution_order(loaded))}")
 
 
 @app.command()
 def plan(
-    pipeline: str = typer.Argument(..., help="Pipeline to plan."),
     force: bool = typer.Option(False, "--force", help="Treat all jobs as rebuilding."),
+    exist: bool = typer.Option(
+        False, "--exist",
+        help="Skip staleness checks: a job is up to date iff its outputs exist on disk.",
+    ),
     rule: list[str] = typer.Option([], "--rule", "-r", help="Only this rule (repeatable)."),
     where: list[str] = typer.Option(
         [], "--where", "-w", help="Only bindings with KEY=VALUE (repeatable)."
@@ -123,8 +115,10 @@ def plan(
     project = _project()
     only, sel = _targets(rule, where)
     try:
-        loaded = load_pipeline(project, pipeline)
-        entries = enginelib.compute_plan(project, loaded, force=force, only=only, where=sel)
+        loaded = load_pipeline(project)
+        entries = enginelib.compute_plan(
+            project, loaded, force=force, only=only, where=sel, exist_only=exist
+        )
     except SmoketreeError as exc:
         _fail(str(exc))
         return
@@ -141,8 +135,11 @@ def plan(
 
 @app.command()
 def run(
-    pipeline: str = typer.Argument(..., help="Pipeline to run."),
     force: bool = typer.Option(False, "--force", help="Ignore cache; re-run all jobs."),
+    exist: bool = typer.Option(
+        False, "--exist",
+        help="Skip staleness checks: run only jobs whose output files are missing.",
+    ),
     rule: list[str] = typer.Option([], "--rule", "-r", help="Only this rule (repeatable)."),
     where: list[str] = typer.Option(
         [], "--where", "-w", help="Only bindings with KEY=VALUE (repeatable)."
@@ -152,9 +149,10 @@ def run(
     project = _project()
     only, sel = _targets(rule, where)
     try:
-        loaded = load_pipeline(project, pipeline)
+        loaded = load_pipeline(project)
         executed = enginelib.run(
-            project, loaded, force=force, only=only, where=sel, report=typer.echo
+            project, loaded, force=force, only=only, where=sel,
+            exist_only=exist, report=typer.echo,
         )
     except SmoketreeError as exc:
         _fail(str(exc))
@@ -164,7 +162,6 @@ def run(
 
 @app.command()
 def reroll(
-    pipeline: str = typer.Argument(..., help="Pipeline to re-roll."),
     rule: list[str] = typer.Option([], "--rule", "-r", help="Only this rule (repeatable)."),
     where: list[str] = typer.Option(
         [], "--where", "-w", help="Only bindings with KEY=VALUE (repeatable)."
@@ -173,12 +170,12 @@ def reroll(
     """Re-roll matched cells: bump each one's counter (a fresh seed) and re-render.
 
     Only rules with `reroll: true` are eligible. Narrow with --rule / --where, e.g.
-    `smoketree reroll g -w idea=sunset`.
+    `smoketree reroll -w idea=sunset`.
     """
     project = _project()
     only, sel = _targets(rule, where)
     try:
-        loaded = load_pipeline(project, pipeline)
+        loaded = load_pipeline(project)
     except SmoketreeError as exc:
         _fail(str(exc))
         return
@@ -209,44 +206,41 @@ def reroll(
 
 
 @app.command()
-def status(
-    pipeline: Optional[str] = typer.Argument(None, help="Pipeline (default: all)."),
-) -> None:
+def status() -> None:
     """Show the state of the last run."""
     project = _project()
-    ids = [pipeline] if pipeline else project.list_graphs()
-    for pid in ids:
-        state = cachelib.State.load(project, pid)
-        if not state.jobs:
-            typer.echo(f"{pid}: no recorded runs")
-            continue
-        typer.secho(f"{pid}:", bold=True)
-        for identity, js in sorted(state.jobs.items()):
-            typer.echo(f"  {identity:<40} {js.completed_at}  hash={js.input_hash[:12]}")
+    pid = project.config.name
+    state = cachelib.State.load(project, pid)
+    if not state.jobs:
+        typer.echo(f"{pid}: no recorded runs")
+        return
+    typer.secho(f"{pid}:", bold=True)
+    for identity, js in sorted(state.jobs.items()):
+        typer.echo(f"  {identity:<40} {js.completed_at}  hash={js.input_hash[:12]}")
 
 
 @app.command()
 def workspace(
-    pipeline: str = typer.Argument(..., help="Pipeline to review."),
     port: int = typer.Option(8765, "--port", help="Port to serve on."),
     host: str = typer.Option("127.0.0.1", "--host", help="Host to bind."),
     no_open: bool = typer.Option(False, "--no-open", help="Don't open a browser."),
 ) -> None:
-    """Open the human-in-the-loop feedback workspace for a built pipeline.
+    """Open the human-in-the-loop feedback workspace for the built project.
 
     Shows every rendered output whose rule declares one or more `feedback` channels and lets
     a human record feedback (notes or a selection), which is saved to the channel file and
     folded back in on the next run.
     """
     project = _project()
+    pipeline = project.config.name
     try:
         from .workspace import build_index
         from .workspace.server import serve
 
-        if not build_index(project, pipeline):
+        if not build_index(project):
             typer.secho(
-                f"No reviewable outputs for '{pipeline}'. Run it first "
-                f"(smoketree run {pipeline}); render rules need a 'feedback:' channel.",
+                "No reviewable outputs. Run it first "
+                "(smoketree run); render rules need a 'feedback:' channel.",
                 fg=typer.colors.YELLOW,
             )
         serve(project, pipeline, host=host, port=port, open_browser=not no_open)
@@ -258,7 +252,6 @@ def workspace(
 
 @app.command()
 def reconcile(
-    pipeline: str = typer.Argument(..., help="Pipeline."),
     merge: bool = typer.Option(False, "--merge", help="3-way merge generated into your copy."),
     take_generated: bool = typer.Option(
         False, "--take-generated", help="Replace your copy with the generated template."
@@ -283,7 +276,7 @@ def reconcile(
     try:
         from . import reconcile as reconcilelib
 
-        loaded = load_pipeline(project, pipeline)
+        loaded = load_pipeline(project)
         drifts = [
             d for d in reconcilelib.find_drift(project, loaded)
             if (only is None or d.rule in only)
@@ -318,13 +311,11 @@ def reconcile(
 
 
 @app.command()
-def purge(
-    pipeline: str = typer.Argument(..., help="Pipeline."),
-) -> None:
-    """Delete a pipeline's managed outputs and recorded state."""
+def purge() -> None:
+    """Delete the project's managed outputs and recorded state."""
     project = _project()
     try:
-        loaded = load_pipeline(project, pipeline)
+        loaded = load_pipeline(project)
     except SmoketreeError as exc:
         _fail(str(exc))
         return
@@ -346,10 +337,10 @@ def purge(
             removed += 1
             typer.echo(f"  removed {path}")
 
-    state_path = project.state_dir / f"{pipeline}.json"
+    state_path = project.state_dir / f"{loaded.id}.json"
     if state_path.exists():
         state_path.unlink()
-    forkbase = project.forkbase_root / pipeline
+    forkbase = project.forkbase_root / loaded.id
     if forkbase.is_dir():
         shutil.rmtree(forkbase)
         typer.echo(f"  removed {state_path}")

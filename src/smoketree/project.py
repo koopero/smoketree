@@ -1,8 +1,9 @@
 """Project discovery and loading.
 
-A Smoketree project is a directory containing ``smoketree.yaml``. The project owns the
-config, the ``.smoketree/`` cache/scratch/state tree, and the ``graphs/`` and
-``transformers/`` definition directories.
+A Smoketree project is a directory containing ``smoketree.yaml``. That single file is
+both the project config and the graph (``models:`` + ``rules:``) — project == graph.
+The project owns the config, the ``.smoketree/`` cache/scratch/state tree, and the
+``transformers/`` definition directory.
 """
 
 from __future__ import annotations
@@ -57,10 +58,6 @@ class Project:
     # ----- directory layout ------------------------------------------------ #
 
     @property
-    def graphs_dir(self) -> Path:
-        return self.root / "graphs"
-
-    @property
     def transformers_dir(self) -> Path:
         return self.root / "transformers"
 
@@ -82,12 +79,6 @@ class Project:
         return self.smoketree_dir / "forkbase"
 
     # ----- definition loading ---------------------------------------------- #
-
-    def graph_path(self, graph_id: str) -> Path:
-        path = self.graphs_dir / f"{graph_id}.yaml"
-        if not path.exists():
-            raise SmoketreeError(f"Graph '{graph_id}' not found at {path}.")
-        return path
 
     def transformer_path(self, name: str) -> Path:
         path = self.transformers_dir / f"{name}.yaml"
@@ -119,8 +110,3 @@ class Project:
             )
         self._transformer_cache[name] = transformer
         return transformer
-
-    def list_graphs(self) -> list[str]:
-        if not self.graphs_dir.exists():
-            return []
-        return sorted(p.stem for p in self.graphs_dir.glob("*.yaml"))

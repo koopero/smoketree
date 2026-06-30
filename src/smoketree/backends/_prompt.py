@@ -59,8 +59,21 @@ def render_prompt(
     image-typed input/context file is attached, regardless of whether the template
     references it — images can't be inlined as text).
     """
+    context, images = build_context(inputs, keys)
+    return render_str(template, context), images
+
+
+_OMIT = object()  # an image: attached to the backend, contributes nothing to the text
+
+
+def build_context(
+    inputs: "dict[str, Path | list[Path]]",
+    keys: dict[str, str],
+) -> tuple[dict[str, Any], list[Path]]:
+    """Expose each input as parsed data (data->object, text->string) under its name, plus
+    every ``{key}`` axis as a string. Returns ``(context, images)`` — images are collected
+    for attachment and rendered as ``""`` (scalar) or dropped (list)."""
     images: list[Path] = []
-    _OMIT = object()  # an image: attached, contributes nothing to the text
 
     def _expose(path: Path) -> Any:
         media = infer_media(path)
@@ -80,12 +93,15 @@ def render_prompt(
         else:
             exposed = _expose(value)
             context[name] = "" if exposed is _OMIT else exposed
+    return context, images
 
+
+def render_str(template: str, context: dict[str, Any]) -> str:
+    """Render one Jinja2 template string over a prepared context."""
     try:
-        rendered = _ENV.from_string(template).render(context)
+        return _ENV.from_string(template).render(context)
     except TemplateError as exc:
         raise ExecutionError(
-            f"Prompt template error: {exc}. "
+            f"Template error: {exc}. "
             f"Available: {', '.join(sorted(context)) or '(none)'}."
         ) from exc
-    return rendered, images

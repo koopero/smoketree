@@ -1,38 +1,344 @@
 # Smoketree
 
-A declarative pipeline tool for media transformation. Smoketree models a project as a DAG
-of artifacts connected by transformations, caches generated artifacts by content-hashing
-inputs, and rebuilds only what has changed.
+Smoketree is Make for human-guided media generation.
 
-`smoketree init` scaffolds a project from a starter template (`smoketree init --list` to
-see them; the default `minimal` is a bare skeleton). Every project also includes a
-project-local `INSTRUCTIONS.md` that documents the model in full (node types, transformers,
-collections and fan-out, caching, and the CLI).
+It is a file-based workflow runner for creative projects that mix scripts, LLMs,
+image/video/audio models, ComfyUI workflows, and human review. You declare where
+artifacts live, Smoketree infers the dependency graph from those paths, runs only
+the stale work, and keeps review notes, approvals, rerolls, and hand edits in the
+loop as ordinary files.
 
-Transformer backends: `shell`, `claude` (Anthropic API), `ollama` (local LLM inference),
-and `comfyui`. For local-first pipelines, use `ollama` transformers — they call a local
-[Ollama](https://ollama.com) server (`defaults.ollama_url`), need no API key, and have the
-deterministic seed injected as `options.seed`.
+The mechanics are make-like. The goal is not to be a generic build system. The goal
+is to make iterative media production manageable:
 
-Graphs can fan out over **collections** (a glob or a tagged `sources` list); transforms
-combine collection inputs with `expand: each | zip | product`, and inputs can select
-tagged items with `references[tag]`. Each expanded execution caches independently.
+- generate many candidates from prompts, source media, schemas, or scripts;
+- review outputs in a local workspace;
+- leave notes, approve, reject, recycle, or reroll individual cells;
+- feed that human input into the next generation pass;
+- rebuild only the affected branches instead of starting over.
+
+ComfyUI designs one generative workflow. Smoketree coordinates whole projects made
+of many workflows, models, scripts, assets, review decisions, and final assemblies.
 
 ## Install
 
-```bash
-uv sync
-```
-
-## Usage
+From this repo:
 
 ```bash
-smoketree init --list              # list starter templates
-smoketree init -t demo             # scaffold from a template (default: minimal)
-smoketree validate demo            # validate a graph
-smoketree plan demo                # show execution plan
-smoketree run demo                 # run a graph
-smoketree status demo              # show last-run state
-smoketree inspect demo NODE        # show a node's scratch dir
-smoketree purge demo               # clear cache/scratch
+uv sync --extra workspace
 ```
+
+If you use hosted Replicate models:
+
+```bash
+uv sync --extra workspace --extra replicate
+```
+
+Then run commands with `uv run smoketree ...`, or activate the virtualenv and call
+`smoketree` directly.
+
+```bash
+uv run smoketree init --list
+uv run smoketree init -t demo
+uv run smoketree validate
+uv run smoketree run
+```
+
+The bundled `demo` template is offline and shell-only. It teaches the path model,
+scatter/map/pool fan-out, and caching without API keys. A project is a single graph:
+`smoketree.yaml` *is* the pipeline, and you run it with `smoketree run`.
+
+## The Workflow
+
+A typical Smoketree project looks like this:
+
+1. Authored source files describe the project: briefs, reference images, songs,
+   schemas, prompts, scripts.
+2. `smoketree.yaml` declares rules that produce artifacts under paths like
+   `work/model/{model}/reference.png` (the project *is* the graph).
+3. `smoketree run` discovers the key values on disk, runs stale rules, and
+   writes generated files.
+4. `smoketree workspace` opens a local review UI for outputs with
+   `feedback:` channels.
+5. You write notes or choose statuses. Those are saved to plain files.
+6. The next run folds that feedback back into prompts, filters, generated assets,
+   or final assemblies.
+
+For example, a rendered output can own a notes channel:
+
+```yaml
+- name: portrait
+  backend: replicate
+  in:
+    prompt: "work/mutant/{mutant}/portrait_prompt.txt"
+  out:
+    image: "work/mutant/{mutant}/portrait.png"
+  reroll: true
+  feedback:
+    - name: notes
+      path: "feedback/mutant/{mutant}/portrait.md"
+      describe: "How should this portrait change?"
+  config:
+    model: black-forest-labs/flux-schnell
+    seed_field: seed
+    params:
+      aspect_ratio: "2:3"
+      output_format: png
+```
+
+Another rule can read those human notes and turn them into a concise directive:
+
+```yaml
+- name: portrait_feedback
+  backend: ollama
+  in:
+    notes: "feedback/mutant/{mutant}/portrait.md"
+  out:
+    directive: "work/mutant/{mutant}/portrait_directive.txt"
+  config:
+    model: gemma4:latest
+    prompt: |
+      Summarize these review notes into one art-direction directive.
+      If there is no feedback, output exactly "(no direction)".
+
+      {{ notes }}
+```
+
+That directive can then feed the prompt-writing rule. Edit one mutant's feedback and
+only that mutant's downstream branch becomes stale.
+
+## A Tiny Review Gate
+
+Feedback can also be structured. A `select` channel seeds a YAML file with one value,
+and a `filter` rule projects only approved items into a downstream set:
+
+```yaml
+name: ideas
+
+rules:
+  - name: review
+    in:
+      seed: "ideas/{idea}/seed.yaml"
+    out:
+      card: "ideas/{idea}/card.txt"
+    feedback:
+      - name: notes
+        path: "ideas/{idea}/notes.md"
+        describe: "Why keep or drop this idea?"
+      - name: status
+        path: "ideas/{idea}/status.yaml"
+        kind: select
+        options: [pending, approve, ignore]
+        describe: "Triage this idea."
+    run: "cp {seed} {card}"
+
+  - name: approved
+    in:
+      seed: "ideas/{idea}/seed.yaml"
+      status: "ideas/{idea}/status.yaml"
+    out:
+      selected: "approved/{idea}/seed.yaml"
+    filter:
+      input: status
+      field: status
+      equals: approve
+    run: "cp {seed} {selected}"
+```
+
+Downstream rules glob `approved/*/seed.yaml`, so the human's review decision becomes
+part of the graph.
+
+## Project Layout
+
+A project commonly uses this shape:
+
+```text
+smoketree.yaml          project config, defaults, and the graph (models + rules)
+sources/                authored inputs
+scripts/                helper scripts called by shell rules
+schema/                 optional JSON Schemas, usually written as YAML
+.smoketree/state/       content hashes from successful runs
+.smoketree/forkbase/    fork bases for authored generated files
+INSTRUCTIONS.md         full project-local guide generated by init
+```
+
+Generated artifacts can live wherever your graph says they live. A common convention
+is `work/` for intermediate outputs, `reviews/` or `feedback/` for human channels,
+and `dist/` or `outputs/` for final products.
+
+## Mental Model
+
+Smoketree graphs are rules over paths.
+
+```yaml
+- name: shout
+  in:
+    line: "work/episode/{episode}/segment/{segment}/line.txt"
+  out:
+    loud: "work/episode/{episode}/segment/{segment}/loud.txt"
+  run: "tr a-z A-Z < {line} > {loud}"
+```
+
+- `{episode}` and `{segment}` are keys. Each key occupies one path segment.
+- A key discovered in an input path fans the rule out once per matching value.
+- The same key name across inputs is a natural join.
+- Distinct key names cross-product.
+- A glob input like `work/episode/{episode}/segment/*/loud.txt` becomes a list.
+- An output key that no input binds is a scatter axis. The rule writes a runtime
+  set of files and the next pass discovers them.
+
+There are no explicit graph edges. If one rule writes a path pattern another rule
+reads, Smoketree infers the dependency. A run repeats planning and execution until
+the project reaches a fixpoint.
+
+## Caching
+
+Each job is content-addressed. Smoketree reruns a job when:
+
+- it has never completed;
+- an output is missing;
+- an input file changed;
+- the rule command, backend config, prompt, model definition, or schema changed;
+- `--force` is passed;
+- a `reroll: true` counter is bumped for that cell.
+
+Large media files are guarded by a cheap mtime/size fingerprint before hashing, so
+unchanged media is not reread needlessly.
+
+## Human-In-The-Loop Tools
+
+`feedback`
+: Seeds human-owned files beside generated outputs. `notes` channels are free text.
+`select` channels are validated single-choice YAML files. Smoketree never clobbers
+human edits.
+
+`workspace`
+: Opens a local review UI for outputs with feedback channels. It shows images,
+videos, text/data previews, notes boxes, select controls, reroll buttons, drift
+warnings, and a run button.
+
+`filter`
+: Keeps or drops a binding based on a YAML/JSON input value. This is useful for
+approval gates, rosters, selected concepts, active shots, and recycling queues.
+
+`reroll`
+: Marks generated cells as eligible for a fresh take. `smoketree reroll
+-w key=value` bumps that cell's counter, folds it into the seed, and reruns it.
+
+`trigger`
+: Adds a human-fired "generate more" button. A trigger writes a fresh marker file,
+which makes a generator run for the next batch without depending on its own output.
+
+`context`
+: Lets a rule read ambient files, such as previous ideas or an ignore list, without
+making those files staleness dependencies. This avoids self-feeding loops.
+
+`author`
+: Splits a generated file into a managed template and a human-owned copy. Downstream
+rules consume the human copy. `smoketree reconcile` helps merge later template drift.
+
+`schema`
+: Validates structured inputs and outputs with JSON Schema. For LLM backends, an
+output schema can also constrain the model response, then write YAML or JSON by
+extension.
+
+## Backends
+
+Rules run through backends:
+
+| Backend | Use |
+| --- | --- |
+| `shell` | Local commands and deterministic assembly. |
+| `openai` | OpenAI chat/vision calls, with optional structured outputs. |
+| `claude` | Anthropic Claude calls. |
+| `ollama` | Local LLM calls through an Ollama server. |
+| `replicate` | Hosted image, video, audio, and utility models. |
+| `comfyui` | A ComfyUI workflow served by a local ComfyUI instance. |
+| `explode` | Fan a YAML/JSON list into per-item files and directories. |
+
+API keys are read from the project `.env` or the environment:
+
+```text
+OPENAI_API_KEY=...
+ANTHROPIC_API_KEY=...
+REPLICATE_API_TOKEN=...
+```
+
+Local service defaults live in `smoketree.yaml`:
+
+```yaml
+name: my-project
+
+defaults:
+  ollama_url: http://localhost:11434
+  comfyui_url: http://localhost:8188
+  max_iterations: 100
+```
+
+Repeated model settings can be declared once under `models:` and referenced by rules:
+
+```yaml
+name: g
+
+models:
+  writer:
+    backend: openai
+    model: gpt-5.1
+    max_tokens: 8000
+  renderer:
+    backend: comfyui
+    workflow: workflows/txt2img.json
+
+rules:
+  - name: prompt
+    model: writer
+    in:
+      brief: "sources/brief.md"
+    out:
+      prompt: "work/prompt.txt"
+    config:
+      prompt: "Write an image prompt from this brief:\n\n{{ brief }}"
+```
+
+The rule's `config:` overrides the shared model config where keys overlap.
+
+## CLI
+
+```bash
+smoketree init --list
+smoketree init -t demo
+smoketree validate
+smoketree plan
+smoketree run
+smoketree run --force
+smoketree run --rule prompt
+smoketree run --where mutant=cinderquill
+smoketree status
+smoketree workspace
+smoketree reroll --where mutant=cinderquill
+smoketree reconcile
+smoketree reconcile --merge
+smoketree purge
+```
+
+Use `smoketree plan` before expensive runs. It shows which jobs will run, skip, wait
+for missing inputs, or drop because a filter no longer passes.
+
+## What Smoketree Is Good At
+
+Smoketree is built for projects like:
+
+- a character generator where each character has portraits, scenes, video clips, and
+  per-stage review notes;
+- a fashion consistency matrix where models, outfits, and settings cross-product into
+  many shots, while feedback lives on the reusable assets;
+- a music-video pipeline that analyzes songs, brainstorms concepts, lets a human gate
+  concepts into a song, renders keyframes, makes transitions, and assembles video;
+- a logo lab that scatters concepts and palettes, renders every combination, gathers
+  notes and approval status, then packages the approved kit;
+- high-volume batch edits where one source axis crosses many target variants and
+  shared expensive preprocessing is reused.
+
+If you just need to run one image graph interactively, use the native tool for that
+graph. If you need to manage a whole creative production loop with reviewable artifacts,
+plain files, and selective rebuilds, that is Smoketree's lane.

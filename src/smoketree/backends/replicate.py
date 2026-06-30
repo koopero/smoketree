@@ -7,9 +7,24 @@ Reads its settings from the rule's ``config`` block:
   fields      per-input overrides: {name: {field: <model-field>, array: bool}}
   image_max_edge  downscale cap for image inputs (px long edge)  (optional)
 
+Any config string may carry **Jinja** referencing the rule's input data (parsed by name)
+and ``{key}`` axes, so the model or a param can be chosen by a data field —
+``aspect_ratio: "{{ '3:4' if concept.kind == 'character' else '16:9' }}"`` or a
+performance-vs-motion ``model``. Plain (marker-free) config is untouched; inputs are hashed
+for staleness, so the raw template is a sound cache key. An **optional** input (rule-level
+``optional:`` list) that matches nothing contributes no field rather than unbinding the rule
+— one rule can i2i when a reference exists and txt2img when it doesn't.
+
 Each input is mapped to a model field by media: text/data -> the file's text, image /
 audio / video / binary -> a ``data:`` URI. Outputs are taken in declared order from the
 prediction result and written to the rule's declared output paths.
+
+A **structured (data) output** — a rule with a single non-scatter ``data`` output port
+(``.json``/``.yaml``) whose model result is a JSON structure rather than a file (a dict, or
+a list of non-file items) — is serialized WHOLE into that port (YAML/JSON by extension), not
+downloaded. This captures models that return rich structured results, e.g. Whisper's
+``{text, segments, ...}`` transcript. FileOutput values nested in the structure are flattened
+to their URLs so it stays JSON-serializable.
 
 A **scatter** output — an ``out`` port whose path carries a ``{key}`` no input binds (e.g.
 ``songs/{song}/stems/{stem}.wav``) — fans the model's structured result across that axis:
@@ -36,6 +51,8 @@ from ..bind import Pattern
 from ..errors import ExecutionError
 from ..images import encode_image
 from ..media import infer_media
+from ..serde import dump_data
+from ._prompt import build_context, render_str
 from .base import Backend, ExecutionContext
 
 _DOWNLOAD_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
@@ -43,17 +60,24 @@ _DOWNLOAD_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.
 # patiently, honouring the "resets in ~Ns" hint Replicate returns in the 429.
 _MAX_RETRIES = 8
 _RETRY_WAIT = 15.0  # fallback when no reset hint is present
+_POLL_INTERVAL = 3.0
+# Default cap on how long to wait for a prediction (incl. cold boot). The blocking SDK
+# `client.run` gives up after ~60s, which fails slow/cold models even though the prediction
+# keeps running; we create + poll instead so a long render completes. Override per-rule with
+# `config.timeout`.
+_DEFAULT_TIMEOUT = 900.0
 
 
 class ReplicateBackend(Backend):
     def execute(self, ctx: ExecutionContext) -> None:
-        cfg = ctx.config
+        cfg = self._render_config(ctx)
         model = cfg.get("model")
         if not model:
             raise ExecutionError(f"Rule '{ctx.rule_name}': replicate config needs a 'model'.")
 
-        inp = self._build_input(ctx)
-        output = self._run_prediction(model, inp)
+        inp = self._build_input(ctx, cfg)
+        timeout = float(cfg.get("timeout", _DEFAULT_TIMEOUT))
+        output = self._run_prediction(model, inp, timeout)
 
         scatter = [name for name in ctx.outputs if self._scatter_axes(ctx, name)]
         if scatter:
@@ -64,6 +88,15 @@ class ReplicateBackend(Backend):
                 )
             self._write_scatter(ctx, scatter[0], model, output)
             return
+
+        # A single data-file output captures the WHOLE structured result (dict / list of
+        # non-file items) as JSON/YAML — e.g. Whisper's {text, segments}. No file download.
+        if len(ctx.outputs) == 1:
+            name, target = next(iter(ctx.outputs.items()))
+            if infer_media(target) == "data" and _is_structured(output):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                dump_data(_jsonable(output), target)
+                return
 
         items = list(output) if isinstance(output, (list, tuple)) else [output]
         for i, (name, target) in enumerate(ctx.outputs.items()):
@@ -79,8 +112,18 @@ class ReplicateBackend(Backend):
             else:
                 target.write_bytes(data)
 
-    def _build_input(self, ctx: ExecutionContext) -> dict:
-        cfg = ctx.config
+    def _render_config(self, ctx: ExecutionContext) -> dict:
+        """Render Jinja in the rule's config over its input data + keys, so model/params can
+        be chosen by a data field (e.g. ``aspect_ratio: "{{ ar[concept.kind] }}"`` or a
+        performance-vs-motion ``model``). Only strings carrying Jinja markers are touched, so
+        plain config is unchanged. Inputs are hashed for staleness, so the raw template as
+        cache key is sound."""
+        if not _has_template(ctx.config):
+            return ctx.config
+        context, _ = build_context(ctx.inputs, ctx.keys)
+        return _render_tree(ctx.config, context)
+
+    def _build_input(self, ctx: ExecutionContext, cfg: dict) -> dict:
         fields = cfg.get("fields", {})
         max_edge = cfg.get("image_max_edge", ctx.project.config.defaults.image_max_edge)
 
@@ -90,6 +133,8 @@ class ReplicateBackend(Backend):
             array = spec.get("array", False)
             field = spec.get("field", name)
             paths = value if isinstance(value, list) else [value]
+            if isinstance(value, list) and not paths:
+                continue  # an optional input that matched nothing — contribute no field
             if isinstance(value, list) and not array:
                 raise ExecutionError(
                     f"Replicate input '{name}' is a multi-file (list) input; set "
@@ -181,7 +226,7 @@ class ReplicateBackend(Backend):
                 return stem
         return f"{index:03d}"
 
-    def _run_prediction(self, model: str, inp: dict):
+    def _run_prediction(self, model: str, inp: dict, timeout: float):
         token = os.environ.get("REPLICATE_API_TOKEN")
         if not token:
             raise ExecutionError(
@@ -196,18 +241,47 @@ class ReplicateBackend(Backend):
                 "with: uv pip install 'smoketree[replicate]'."
             ) from exc
         client = replicate.Client(api_token=token)
+        prediction = self._create_prediction(client, model, inp)
+        # Poll until terminal — outlasts cold boots (unlike the ~60s blocking client.run).
+        deadline = time.monotonic() + timeout
+        while prediction.status not in ("succeeded", "failed", "canceled"):
+            if time.monotonic() > deadline:
+                try:
+                    prediction.cancel()
+                except Exception:
+                    pass
+                raise ExecutionError(
+                    f"Replicate prediction for model '{model}' timed out after {timeout:.0f}s "
+                    f"(status {prediction.status!r}). Raise the rule's `config.timeout`."
+                )
+            time.sleep(_POLL_INTERVAL)
+            prediction.reload()
+        if prediction.status != "succeeded":
+            raise ExecutionError(
+                f"Replicate prediction for model '{model}' {prediction.status}: "
+                f"{prediction.error}"
+            )
+        return prediction.output
+
+    def _create_prediction(self, client, model: str, inp: dict):
+        """Create a prediction (non-blocking), honouring throttle 429s with patient retries."""
+        name, _, version = model.partition(":")
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
-                return client.run(model, input=inp)
+                if version:
+                    return client.predictions.create(version=version, input=inp)
+                return client.models.predictions.create(name, input=inp)
             except Exception as exc:  # the SDK raises a range of error types
                 last_exc = exc
                 if _is_throttle(exc) and attempt < _MAX_RETRIES - 1:
                     time.sleep(_retry_wait(exc))
                     continue
-                break
+                raise ExecutionError(
+                    f"Replicate prediction for model '{model}' failed to start: {exc}"
+                ) from exc
         raise ExecutionError(
-            f"Replicate prediction for model '{model}' failed: {last_exc}"
+            f"Replicate prediction for model '{model}' failed to start: {last_exc}"
         ) from last_exc
 
     def _extract(self, item, target: Path):
@@ -232,6 +306,58 @@ class ReplicateBackend(Backend):
 def _slug(value: object) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
     return s or "item"
+
+
+def _has_template(obj: object) -> bool:
+    """Whether any string anywhere in a config tree carries a Jinja marker."""
+    if isinstance(obj, str):
+        return "{{" in obj or "{%" in obj
+    if isinstance(obj, dict):
+        return any(_has_template(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_has_template(v) for v in obj)
+    return False
+
+
+def _render_tree(obj: object, context: dict):
+    """Recursively render Jinja in every templated string of a config tree."""
+    if isinstance(obj, str):
+        return render_str(obj, context) if ("{{" in obj or "{%" in obj) else obj
+    if isinstance(obj, dict):
+        return {k: _render_tree(v, context) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_render_tree(v, context) for v in obj]
+    return obj
+
+
+def _is_file_like(item: object) -> bool:
+    """Whether a model-output item is a FILE (SDK FileOutput, URL string), not inline data."""
+    if callable(getattr(item, "read", None)):
+        return True
+    if isinstance(getattr(item, "url", None), str):
+        return True
+    return isinstance(item, str) and item.startswith(("http://", "https://"))
+
+
+def _is_structured(output: object) -> bool:
+    """Whether a model result is inline JSON data (serialize whole) vs file(s) (download)."""
+    if isinstance(output, dict):
+        return True
+    if isinstance(output, list):
+        return not any(_is_file_like(x) for x in output)
+    return False
+
+
+def _jsonable(obj: object):
+    """Recursively flatten any FileOutput value to its URL so the result is JSON-serializable."""
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    url = getattr(obj, "url", None)
+    if isinstance(url, str):
+        return url
+    return obj
 
 
 def _data_uri(path: Path) -> str:

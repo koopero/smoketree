@@ -1,0 +1,33 @@
+name: batching-prompts
+
+defaults:
+  max_iterations: 100
+  ollama_url: http://localhost:11434
+
+# The model is defined once, here. Switch the whole pipeline between Ollama, Claude,
+# and OpenAI by editing this one block — every rule that references `writer` follows.
+# Uncomment exactly one backend/model pair:
+models:
+  writer:
+    backend: ollama
+    model: gemma4:latest          # local, no key, no cost (needs `ollama serve`)
+    # backend: claude
+    # model: claude-opus-4-8      # needs ANTHROPIC_API_KEY
+    # backend: openai
+    # model: gpt-5.1              # needs OPENAI_API_KEY
+
+# Fan one prompt template across many inputs = batching. Each {item} discovered under
+# sources/ becomes one model call. The project is the graph: rules live in smoketree.yaml.
+rules:
+  - name: blurb
+    model: writer                 # backend + model come from the def above
+    in:
+      topic: "sources/item/{item}/topic.txt"
+    out:
+      blurb: "work/item/{item}/blurb.txt"
+    config:
+      prompt: |
+        Write a single-sentence product blurb for the following item.
+        Reply with only the sentence, no preamble.
+
+        Item: {{ topic }}

@@ -48,9 +48,9 @@ def _slug(keys: dict[str, str]) -> str:
     return ",".join(f"{k}={keys[k]}" for k in sorted(keys))
 
 
-def build_index(project: Project, pipeline_id: str) -> list[FeedbackCard]:
+def build_index(project: Project) -> list[FeedbackCard]:
     """Index every reviewable output (a rule with ``feedback``) from the last run."""
-    loaded = load_pipeline(project, pipeline_id)
+    loaded = load_pipeline(project)
     root = project.root
     cards: list[FeedbackCard] = []
 

@@ -23,8 +23,8 @@ from smoketree.scaffold import init_project
 
 def make_project(tmp_path: Path, pipeline_yaml: str, name: str = "p") -> Project:
     init_project(tmp_path, name, template="minimal")
-    (tmp_path / "graphs").mkdir(exist_ok=True)
-    (tmp_path / "graphs" / "g.yaml").write_text(pipeline_yaml)
+    # project == graph: the pipeline (name + rules) lives in smoketree.yaml itself.
+    (tmp_path / "smoketree.yaml").write_text(pipeline_yaml)
     return Project(tmp_path)
 
 
@@ -36,7 +36,7 @@ def write(root: Path, rel: str, content: str = "x\n") -> Path:
 
 
 def run(project: Project) -> int:
-    loaded = load_pipeline(project, "g")
+    loaded = load_pipeline(project)
     return enginelib.run(project, loaded)
 
 
@@ -149,7 +149,7 @@ def test_unknown_command_variable_rejected(tmp_path: Path):
         '    out:\n      b: "out/{k}.txt"\n    run: "cp {a} {nope}"\n',
     )
     with pytest.raises(SmoketreeError):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 def test_duplicate_rule_rejected(tmp_path: Path):
@@ -160,7 +160,7 @@ def test_duplicate_rule_rejected(tmp_path: Path):
         '  - name: r\n    in:\n      a: "y/{k}.txt"\n    out:\n      b: "p/{k}.txt"\n    run: "cp {a} {b}"\n',
     )
     with pytest.raises(SmoketreeError):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 def test_infer_dependencies_links_producer_to_consumer():
@@ -263,7 +263,7 @@ def test_prune_removes_vanished_segment(tmp_path: Path):
 def test_force_rebuilds_everything(tmp_path: Path):
     project = _demo_project(tmp_path)
     run(project)
-    loaded = load_pipeline(project, "g")
+    loaded = load_pipeline(project)
     assert enginelib.run(project, loaded, force=True) > 0
 
 
@@ -298,13 +298,13 @@ def test_max_iterations_breaker(tmp_path: Path):
     project = make_project(
         tmp_path,
         "name: g\n"
+        "defaults:\n  max_iterations: 5\n"
         "rules:\n"
         "  - name: grow\n"
         '    in:\n      seed: "seed/{n}.txt"\n'
         '    out:\n      next: "seed/{n}x.txt"\n'
         '    run: "cp {seed} {next}"\n',
     )
-    (tmp_path / "smoketree.yaml").write_text("name: p\ndefaults:\n  max_iterations: 5\n")
     write(tmp_path, "seed/a.txt")
     project = Project(tmp_path)
     with pytest.raises(ExecutionError):
@@ -396,7 +396,7 @@ def test_feedback_unknown_key_rejected(tmp_path: Path):
         '      - path: "feedback/{other}/notes.md"\n',
     )
     with pytest.raises(SmoketreeError):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 # --------------------------------------------------------------------------- #
@@ -423,7 +423,7 @@ def test_workspace_index_pairs_output_with_channel(tmp_path: Path):
     write(tmp_path, "work/a/out.png", "img-a")
     write(tmp_path, "work/b/out.png", "img-b")
 
-    cards = build_index(project, "g")
+    cards = build_index(project)
     by_label = {c.label: c for c in cards}
     assert set(by_label) == {"a", "b"}
     card = by_label["a"]
@@ -456,7 +456,7 @@ def test_workspace_replaces_seed_placeholder(tmp_path: Path):
     write(tmp_path, "work/a/out.png", "img-a")
     write(tmp_path, "feedback/a/notes.md", "(no feedback yet)\n")  # seeded, untouched
 
-    ch = build_index(project, "g")[0].channels[0]
+    ch = build_index(project)[0].channels[0]
     assert ch.has_note is False  # placeholder doesn't count as a note
     add_note(ch, "first real note")
     assert (tmp_path / "feedback/a/notes.md").read_text() == "first real note\n"
@@ -466,7 +466,7 @@ def test_workspace_index_empty_before_render(tmp_path: Path):
     from smoketree.workspace.index import build_index
 
     project = make_project(tmp_path, WORKSPACE_PIPE)
-    assert build_index(project, "g") == []  # no outputs on disk yet
+    assert build_index(project) == []  # no outputs on disk yet
 
 
 # --------------------------------------------------------------------------- #
@@ -516,7 +516,7 @@ def test_select_invalid_default_rejected(tmp_path: Path):
         "        options: [a, b]\n        default: zzz\n",
     )
     with pytest.raises(SmoketreeError, match="not in options"):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 def test_workspace_renders_and_sets_select(tmp_path: Path):
@@ -526,7 +526,7 @@ def test_workspace_renders_and_sets_select(tmp_path: Path):
     write(tmp_path, "sources/alpha/p.txt", "an idea\n")
     run(project)  # renders + seeds both channels
 
-    card = build_index(project, "g")[0]
+    card = build_index(project)[0]
     by_name = {c.name: c for c in card.channels}
     assert set(by_name) == {"content", "status"}
     sel = by_name["status"]
@@ -534,7 +534,7 @@ def test_workspace_renders_and_sets_select(tmp_path: Path):
     assert sel.value == "pending" and card.flagged is False  # default = untouched
 
     set_select(sel, "approve")
-    card2 = build_index(project, "g")[0]
+    card2 = build_index(project)[0]
     status = {c.name: c for c in card2.channels}["status"]
     assert status.value == "approve"
     assert card2.flagged is True  # a non-default selection flags the card
@@ -546,7 +546,7 @@ def test_set_select_rejects_unknown_value(tmp_path: Path):
     project = make_project(tmp_path, MULTI_CHANNEL_PIPE)
     write(tmp_path, "sources/alpha/p.txt", "an idea\n")
     run(project)
-    sel = {c.name: c for c in build_index(project, "g")[0].channels}["status"]
+    sel = {c.name: c for c in build_index(project)[0].channels}["status"]
     with pytest.raises(ValueError):
         set_select(sel, "bogus")
 
@@ -580,6 +580,24 @@ def test_filter_projects_only_matching(tmp_path: Path):
     assert (tmp_path / "approved/alpha/seed.yaml").exists()
     assert not (tmp_path / "approved/beta").exists()
     assert run(project) == 0  # idempotent
+
+
+def test_filter_reads_context_input(tmp_path: Path):
+    """filter.input may be an ambient context input (so a backend never sees the gate file)."""
+    pipe = (
+        "name: g\nrules:\n"
+        "  - name: approve\n"
+        '    in:\n      seed: "ideas/{idea}/seed.yaml"\n'
+        '    context:\n      status: "ideas/{idea}/status.yaml"\n'
+        '    out:\n      sel: "approved/{idea}/seed.yaml"\n'
+        "    filter: { input: status, field: status, equals: approve }\n"
+        '    run: "cp {seed} {sel}"\n'
+    )
+    project = make_project(tmp_path, pipe)
+    _ideas(tmp_path, alpha="approve", beta="pending")
+    assert run(project) == 1  # only alpha passes, gated by a context file
+    assert (tmp_path / "approved/alpha/seed.yaml").exists()
+    assert not (tmp_path / "approved/beta").exists()
 
 
 def test_filter_drops_output_when_unapproved(tmp_path: Path):
@@ -625,7 +643,7 @@ def test_filter_unknown_input_rejected(tmp_path: Path):
         '    run: "cp {seed} {sel}"\n',
     )
     with pytest.raises(ValidationError, match="not a declared input"):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 def test_filter_requires_exactly_one_predicate(tmp_path: Path):
@@ -638,7 +656,7 @@ def test_filter_requires_exactly_one_predicate(tmp_path: Path):
         '    run: "cp {status} {sel}"\n',
     )
     with pytest.raises(SmoketreeError, match="exactly one"):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 # --------------------------------------------------------------------------- #
@@ -648,7 +666,7 @@ def test_filter_requires_exactly_one_predicate(tmp_path: Path):
 
 def _run_log(project: Project):
     lines: list[str] = []
-    n = enginelib.run(project, load_pipeline(project, "g"), report=lines.append)
+    n = enginelib.run(project, load_pipeline(project), report=lines.append)
     return n, lines
 
 
@@ -703,7 +721,7 @@ def test_context_name_collision_rejected(tmp_path: Path):
         '    out:\n      o: "o.txt"\n    run: "cp {x} {o}"\n',
     )
     with pytest.raises(ValidationError, match="collide"):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 # --------------------------------------------------------------------------- #
@@ -801,7 +819,7 @@ def _target_project(tmp_path: Path) -> Project:
 
 def test_run_only_rule(tmp_path: Path):
     project = _target_project(tmp_path)
-    n = enginelib.run(project, load_pipeline(project, "g"), only={"a"})
+    n = enginelib.run(project, load_pipeline(project), only={"a"})
     assert n == 2  # a(p), a(q)
     assert (tmp_path / "work/a/p.txt").exists() and (tmp_path / "work/a/q.txt").exists()
     assert not (tmp_path / "work/b").exists()  # rule b never ran
@@ -809,7 +827,7 @@ def test_run_only_rule(tmp_path: Path):
 
 def test_run_where_key(tmp_path: Path):
     project = _target_project(tmp_path)
-    n = enginelib.run(project, load_pipeline(project, "g"), where={"m": "p"})
+    n = enginelib.run(project, load_pipeline(project), where={"m": "p"})
     assert n == 2  # a(p), b(p)
     assert (tmp_path / "work/a/p.txt").exists()
     assert not (tmp_path / "work/a/q.txt").exists()  # q filtered out
@@ -817,7 +835,7 @@ def test_run_where_key(tmp_path: Path):
 
 def test_run_only_rule_and_where(tmp_path: Path):
     project = _target_project(tmp_path)
-    n = enginelib.run(project, load_pipeline(project, "g"), only={"a"}, where={"m": "p"})
+    n = enginelib.run(project, load_pipeline(project), only={"a"}, where={"m": "p"})
     assert n == 1  # just a(p)
     assert (tmp_path / "work/a/p.txt").exists()
     assert not (tmp_path / "work/a/q.txt").exists()
@@ -827,12 +845,12 @@ def test_run_only_rule_and_where(tmp_path: Path):
 def test_run_unknown_rule_errors(tmp_path: Path):
     project = _target_project(tmp_path)
     with pytest.raises(ExecutionError, match="No such rule"):
-        enginelib.run(project, load_pipeline(project, "g"), only={"zzz"})
+        enginelib.run(project, load_pipeline(project), only={"zzz"})
 
 
 def test_plan_respects_only(tmp_path: Path):
     project = _target_project(tmp_path)
-    entries = enginelib.compute_plan(project, load_pipeline(project, "g"), only={"a"})
+    entries = enginelib.compute_plan(project, load_pipeline(project), only={"a"})
     assert entries and all(e.identity.startswith("a") for e in entries)
 
 
@@ -912,7 +930,7 @@ def test_author_unknown_port_rejected(tmp_path: Path):
         '    run: "cp {x} {y}"\n',
     )
     with pytest.raises(ValidationError, match="not in out"):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 # --------------------------------------------------------------------------- #
@@ -932,7 +950,7 @@ def test_reconcile_reports_no_drift_when_template_unchanged(tmp_path: Path):
     from smoketree import reconcile as rec
 
     project = _drifted_author_project(tmp_path)
-    assert rec.find_drift(project, load_pipeline(project, "g")) == []
+    assert rec.find_drift(project, load_pipeline(project)) == []
 
 
 def test_reconcile_detects_drift(tmp_path: Path):
@@ -942,7 +960,7 @@ def test_reconcile_detects_drift(tmp_path: Path):
     write(tmp_path, "src/p.txt", "line one\nCHANGED two\nline three\n")
     run(project)  # template moves; copy untouched -> drift
 
-    drifts = rec.find_drift(project, load_pipeline(project, "g"))
+    drifts = rec.find_drift(project, load_pipeline(project))
     assert len(drifts) == 1
     assert drifts[0].authored == tmp_path / "work/p/brief.md"
     assert drifts[0].copy_edited is False
@@ -958,14 +976,14 @@ def test_reconcile_merge_combines_edits(tmp_path: Path):
     write(tmp_path, "src/p.txt", "line one\nline two\nGEN three\n")
     run(project)
 
-    [drift] = rec.find_drift(project, load_pipeline(project, "g"))
+    [drift] = rec.find_drift(project, load_pipeline(project))
     assert drift.copy_edited is True
     status = rec.resolve(drift, "merge")
     assert "0 conflict" in status or "cleanly" in status
     # both edits survive
     assert (tmp_path / "work/p/brief.md").read_text() == "MY one\nline two\nGEN three\n"
     # fork-base advanced -> drift clears
-    assert rec.find_drift(project, load_pipeline(project, "g")) == []
+    assert rec.find_drift(project, load_pipeline(project)) == []
 
 
 def test_reconcile_merge_marks_conflict(tmp_path: Path):
@@ -976,7 +994,7 @@ def test_reconcile_merge_marks_conflict(tmp_path: Path):
     write(tmp_path, "src/p.txt", "line one\nGEN two\nline three\n")  # same line, both
     run(project)
 
-    [drift] = rec.find_drift(project, load_pipeline(project, "g"))
+    [drift] = rec.find_drift(project, load_pipeline(project))
     status = rec.resolve(drift, "merge")
     assert "conflict" in status
     merged = (tmp_path / "work/p/brief.md").read_text()
@@ -991,19 +1009,19 @@ def test_reconcile_take_generated_and_keep_mine(tmp_path: Path):
     write(tmp_path, "src/p.txt", "generated v2\n")
     run(project)
 
-    [drift] = rec.find_drift(project, load_pipeline(project, "g"))
+    [drift] = rec.find_drift(project, load_pipeline(project))
     rec.resolve(drift, "take-generated")
     assert (tmp_path / "work/p/brief.md").read_text() == "generated v2\n"
-    assert rec.find_drift(project, load_pipeline(project, "g")) == []  # base advanced
+    assert rec.find_drift(project, load_pipeline(project)) == []  # base advanced
 
     # now drift again; keep-mine leaves the copy but dismisses the drift
     write(tmp_path, "work/p/brief.md", "my version 2\n")
     write(tmp_path, "src/p.txt", "generated v3\n")
     run(project)
-    [drift] = rec.find_drift(project, load_pipeline(project, "g"))
+    [drift] = rec.find_drift(project, load_pipeline(project))
     rec.resolve(drift, "keep-mine")
     assert (tmp_path / "work/p/brief.md").read_text() == "my version 2\n"
-    assert rec.find_drift(project, load_pipeline(project, "g")) == []
+    assert rec.find_drift(project, load_pipeline(project)) == []
 
 
 def test_workspace_server_drift_and_reconcile(tmp_path: Path):
@@ -1058,7 +1076,7 @@ def test_bump_roll_increments(tmp_path: Path):
     project = make_project(tmp_path, REROLL_SHELL_PIPE)
     write(tmp_path, "src/p.txt", "hi\n")
     run(project)
-    loaded = load_pipeline(project, "g")
+    loaded = load_pipeline(project)
     [binding] = [b for r in loaded.rules for b in bind_rule(project.root, r)]
     assert enginelib.bump_roll(binding) == 1
     assert enginelib.bump_roll(binding) == 2
@@ -1295,7 +1313,7 @@ def test_trigger_marker_key_must_be_bound_by_input(tmp_path: Path):
     )
     project = make_project(tmp_path, bad)
     with pytest.raises(ValidationError):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 def test_fire_trigger_writes_marker_and_run_fires_next_round(tmp_path: Path):
@@ -1313,7 +1331,7 @@ def test_fire_trigger_writes_marker_and_run_fires_next_round(tmp_path: Path):
     assert (tmp_path / "done/sunset/lede.yaml").exists()
 
     # Fire the trigger: a fresh marker is written, and the next run skips sunset.
-    rule_obj = next(r for r in load_pipeline(project, "g").rules if r.name == "brainstorm")
+    rule_obj = next(r for r in load_pipeline(project).rules if r.name == "brainstorm")
     marker = fire_trigger(project, rule_obj, round_id="r-test-2")
     assert marker == tmp_path / "runs/r-test-2/go.txt"
     assert marker.read_text() == "go\n"
@@ -1560,7 +1578,7 @@ def test_explode_requires_scatter_key(tmp_path: Path):
         "    backend: explode\n",
     )
     with pytest.raises(ValidationError, match="scatter"):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 # --------------------------------------------------------------------------- #
@@ -1576,7 +1594,7 @@ def test_env_substitution(monkeypatch):
 def test_demo_template_runs_end_to_end(tmp_path: Path):
     init_project(tmp_path, "proj", template="demo")
     project = Project(tmp_path)
-    loaded = load_pipeline(project, "demo")
+    loaded = load_pipeline(project)
     assert enginelib.run(project, loaded) > 0
     report = (tmp_path / "report.txt").read_text()
     assert "THE SMOKETREE DIFFUSES LIKE PIXELS" in report
@@ -1660,7 +1678,7 @@ def test_replicate_build_input_maps_fields(tmp_path: Path):
         },
         seed=42,
     )
-    inp = ReplicateBackend()._build_input(ctx)
+    inp = ReplicateBackend()._build_input(ctx, ctx.config)
     assert inp["aspect_ratio"] == "2:3"
     assert inp["prompt"] == "make a portrait"
     assert isinstance(inp["input_images"], list)
@@ -1690,26 +1708,54 @@ def test_replicate_accumulates_array_field(tmp_path: Path):
             },
         },
     )
-    inp = ReplicateBackend()._build_input(ctx)
+    inp = ReplicateBackend()._build_input(ctx, ctx.config)
     assert len(inp["input_images"]) == 2  # both refs present, not overwritten
     assert all(v.startswith("data:image/png;base64,") for v in inp["input_images"])
 
 
-def test_replicate_backend_runs_via_engine(tmp_path: Path, monkeypatch):
-    import sys
+def _fake_replicate(output):
+    """A fake `replicate` module whose predictions.create returns a succeeded prediction.
+
+    Mirrors the backend's create-and-poll flow. Returns (module, captured) where
+    captured['input'] is the input dict the backend sent.
+    """
     import types
 
-    fake = types.ModuleType("replicate")
+    captured: dict = {}
+
+    class _Pred:
+        status = "succeeded"
+        error = None
+
+        def __init__(self, out):
+            self.output = out
+
+        def reload(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    class _Preds:
+        def create(self, name=None, version=None, input=None):
+            captured["input"] = input
+            captured["model"] = name or version
+            return _Pred(output)
 
     class FakeClient:
         def __init__(self, api_token=None):
-            pass
+            self.predictions = _Preds()
+            self.models = types.SimpleNamespace(predictions=_Preds())
 
-        def run(self, model, input):
-            assert input["prompt"] == "hello prompt"
-            return b"IMGBYTES"
+    mod = types.ModuleType("replicate")
+    mod.Client = FakeClient
+    return mod, captured
 
-    fake.Client = FakeClient
+
+def test_replicate_backend_runs_via_engine(tmp_path: Path, monkeypatch):
+    import sys
+
+    fake, captured = _fake_replicate(b"IMGBYTES")
     monkeypatch.setitem(sys.modules, "replicate", fake)
     monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
 
@@ -1724,26 +1770,176 @@ def test_replicate_backend_runs_via_engine(tmp_path: Path, monkeypatch):
     write(tmp_path, "work/alpha/prompt.txt", "hello prompt")
     run(project)
     assert (tmp_path / "work/alpha/portrait.png").read_bytes() == b"IMGBYTES"
+    assert captured["input"]["prompt"] == "hello prompt"  # input was sent to the prediction
+
+
+def test_replicate_structured_output_serialized_to_data_file(tmp_path: Path, monkeypatch):
+    """A model returning a JSON structure into a single data (.json) output is serialized whole."""
+    import json
+    import sys
+
+    transcript = {
+        "text": "hello world",
+        "segments": [
+            {"start": 0.0, "end": 1.0, "text": "hello"},
+            {"start": 1.0, "end": 2.0, "text": "world"},
+        ],
+        "detected_language": "english",
+    }
+    fake, captured = _fake_replicate(transcript)
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: transcribe\n    backend: replicate\n"
+        '    in:\n      audio: "songs/{song}/source.mp3"\n'
+        '    out:\n      transcript: "songs/{song}/transcript.json"\n'
+        "    config:\n      model: openai/whisper\n",
+    )
+    write(tmp_path, "songs/mai-tai/source.mp3", "ID3FAKEMP3")
+    executed = run(project)
+
+    assert executed == 1
+    out = tmp_path / "songs/mai-tai/transcript.json"
+    assert json.loads(out.read_text()) == transcript  # whole dict, not a download
+    assert captured["input"]["audio"].startswith("data:audio/mpeg;base64,")
+    assert run(project) == 0  # idempotent
+
+
+def test_replicate_optional_input_absent_does_not_unbind_or_send_field(tmp_path, monkeypatch):
+    """An optional input matching nothing still runs the rule and contributes no model field."""
+    import sys
+
+    fake, captured = _fake_replicate(b"IMG")
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+
+    spec = (
+        "name: g\nrules:\n"
+        "  - name: render\n    backend: replicate\n"
+        '    in:\n      prompt: "work/{m}/prompt.txt"\n      hint: "work/{m}/hint.txt"\n'
+        "    optional: [hint]\n"
+        '    out:\n      image: "work/{m}/out.png"\n'
+        "    config:\n      model: owner/flux\n"
+        "      fields:\n        hint: {field: extra, array: true}\n"
+    )
+    project = make_project(tmp_path, spec)
+    write(tmp_path, "work/alpha/prompt.txt", "a prompt")  # no hint.txt -> optional absent
+    assert run(project) == 1
+    assert (tmp_path / "work/alpha/out.png").read_bytes() == b"IMG"
+    assert "extra" not in captured["input"]  # absent optional -> field omitted
+
+
+def test_replicate_optional_input_present_is_bound(tmp_path, monkeypatch):
+    """When the optional input exists it binds and feeds its model field."""
+    import sys
+
+    fake, captured = _fake_replicate(b"IMG")
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+
+    spec = (
+        "name: g\nrules:\n"
+        "  - name: render\n    backend: replicate\n"
+        '    in:\n      prompt: "work/{m}/prompt.txt"\n      hint: "work/{m}/hint.txt"\n'
+        "    optional: [hint]\n"
+        '    out:\n      image: "work/{m}/out.png"\n'
+        "    config:\n      model: owner/flux\n"
+        "      fields:\n        hint: {field: extra, array: true}\n"
+    )
+    project = make_project(tmp_path, spec)
+    write(tmp_path, "work/alpha/prompt.txt", "a prompt")
+    write(tmp_path, "work/alpha/hint.txt", "a hint")
+    assert run(project) == 1
+    assert captured["input"]["extra"] == ["a hint"]  # present optional -> field carried
+
+
+def test_replicate_config_param_chosen_by_input_data_field(tmp_path, monkeypatch):
+    """A param can be selected from an input's data — e.g. aspect_ratio by concept kind."""
+    import sys
+
+    fake, captured = _fake_replicate(b"IMG")
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+
+    spec = (
+        "name: g\nrules:\n"
+        "  - name: render\n    backend: replicate\n"
+        '    in:\n      prompt: "c/{c}/prompt.txt"\n      concept: "c/{c}/concept.json"\n'
+        '    out:\n      image: "c/{c}/ref.png"\n'
+        "    config:\n      model: owner/flux\n      params:\n"
+        "        aspect_ratio: \"{{ '3:4' if concept.kind == 'character' else '16:9' }}\"\n"
+    )
+    project = make_project(tmp_path, spec)
+    write(tmp_path, "c/akari/prompt.txt", "p")
+    write(tmp_path, "c/akari/concept.json", '{"kind": "character"}')
+    assert run(project) == 1
+    assert captured["input"]["aspect_ratio"] == "3:4"
+
+
+def test_replicate_model_chosen_by_input_data_field(tmp_path, monkeypatch):
+    """The model itself can be data-driven — performance shots vs motion shots."""
+    import sys
+
+    fake, captured = _fake_replicate(b"IMG")
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+
+    spec = (
+        "name: g\nrules:\n"
+        "  - name: clip\n    backend: replicate\n"
+        '    in:\n      frame: "s/{s}/seed.json"\n'
+        '    out:\n      clip: "s/{s}/clip.json"\n'
+        "    config:\n"
+        "      model: \"{{ 'owner/pvideo' if frame.role == 'performance' else 'owner/wan' }}\"\n"
+    )
+    project = make_project(tmp_path, spec)
+    write(tmp_path, "s/000/seed.json", '{"role": "performance"}')
+    assert run(project) == 1
+    assert captured["model"] == "owner/pvideo"
+
+
+def test_rule_optional_must_reference_declared_input(tmp_path: Path):
+    spec = (
+        "name: g\nrules:\n"
+        "  - name: render\n    backend: replicate\n"
+        '    in:\n      prompt: "work/{m}/prompt.txt"\n'
+        "    optional: [missing]\n"
+        '    out:\n      image: "work/{m}/out.png"\n'
+        "    config:\n      model: owner/flux\n"
+    )
+    project = make_project(tmp_path, spec)
+    with pytest.raises(ValidationError, match="not declared inputs"):
+        load_pipeline(project)
+
+
+def test_replicate_jsonable_flattens_file_outputs(tmp_path: Path):
+    """Nested FileOutput values in a structured result flatten to their URLs (JSON-safe)."""
+    import types
+
+    from smoketree.backends.replicate import _is_structured, _jsonable
+
+    file_out = types.SimpleNamespace(url="https://replicate.delivery/x/clip.mp4")
+    result = {"caption": "a clip", "frames": [file_out]}
+    assert _is_structured(result) is True
+    assert _jsonable(result) == {
+        "caption": "a clip",
+        "frames": ["https://replicate.delivery/x/clip.mp4"],
+    }
+    # A bare list of file outputs is NOT structured data — those are downloadable files.
+    assert _is_structured([file_out]) is False
 
 
 def test_replicate_scatter_fans_named_result_across_stem_axis(tmp_path: Path, monkeypatch):
     """A {stem} key no input binds fans one model call into one wav per named stem."""
     import sys
-    import types
 
-    fake = types.ModuleType("replicate")
-    captured: dict = {}
-
-    class FakeClient:
-        def __init__(self, api_token=None):
-            pass
-
-        def run(self, model, input):
-            captured.update(input)
-            # A demucs-style mapping result: one file per named stem.
-            return {"vocals": b"VOX", "drums": b"DRM", "bass": b"BAS", "other": b"OTH"}
-
-    fake.Client = FakeClient
+    # A demucs-style mapping result: one file per named stem.
+    fake, captured = _fake_replicate(
+        {"vocals": b"VOX", "drums": b"DRM", "bass": b"BAS", "other": b"OTH"}
+    )
     monkeypatch.setitem(sys.modules, "replicate", fake)
     monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
 
@@ -1765,7 +1961,7 @@ def test_replicate_scatter_fans_named_result_across_stem_axis(tmp_path: Path, mo
     assert (stems / "bass.wav").read_bytes() == b"BAS"
     assert (stems / "other.wav").read_bytes() == b"OTH"
     # The mp3 went up as an audio data URI, not raw text.
-    assert captured["song"].startswith("data:audio/mpeg;base64,")
+    assert captured["input"]["song"].startswith("data:audio/mpeg;base64,")
     # Idempotent: the scatter rule does not re-run once its stems exist.
     assert run(project) == 0
 
@@ -1783,19 +1979,10 @@ def test_replicate_scatter_names_list_result_from_url_basename(tmp_path: Path, m
         def read(self):
             return self._data
 
-    fake = types.ModuleType("replicate")
-
-    class FakeClient:
-        def __init__(self, api_token=None):
-            pass
-
-        def run(self, model, input):
-            return [
-                FakeFile("https://replicate.delivery/x/bass.wav", b"BAS"),
-                FakeFile("https://replicate.delivery/x/other.wav?token=1", b"OTH"),
-            ]
-
-    fake.Client = FakeClient
+    fake, captured = _fake_replicate([
+        FakeFile("https://replicate.delivery/x/bass.wav", b"BAS"),
+        FakeFile("https://replicate.delivery/x/other.wav?token=1", b"OTH"),
+    ])
     monkeypatch.setitem(sys.modules, "replicate", fake)
     monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
 
@@ -1816,18 +2003,8 @@ def test_replicate_scatter_names_list_result_from_url_basename(tmp_path: Path, m
 
 def test_replicate_scatter_must_be_sole_output(tmp_path: Path, monkeypatch):
     import sys
-    import types
 
-    fake = types.ModuleType("replicate")
-
-    class FakeClient:
-        def __init__(self, api_token=None):
-            pass
-
-        def run(self, model, input):
-            return {"vocals": b"VOX"}
-
-    fake.Client = FakeClient
+    fake, captured = _fake_replicate({"vocals": b"VOX"})
     monkeypatch.setitem(sys.modules, "replicate", fake)
     monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
 
@@ -1844,6 +2021,55 @@ def test_replicate_scatter_must_be_sole_output(tmp_path: Path, monkeypatch):
     write(tmp_path, "songs/s/source.mp3", "ID3")
     with pytest.raises(ExecutionError, match="only output"):
         run(project)
+
+
+def test_replicate_polls_until_prediction_succeeds(tmp_path: Path, monkeypatch):
+    """The backend create-and-polls, so a cold-booting prediction completes (not the ~60s
+    blocking client.run that times out)."""
+    import sys
+    import types
+
+    states = ["processing", "succeeded"]  # not done on first poll
+
+    class _Pred:
+        error = None
+
+        def __init__(self):
+            self.status = "starting"
+            self.output = b"COLDBOOTBYTES"
+
+        def reload(self):
+            self.status = states.pop(0) if states else "succeeded"
+
+        def cancel(self):
+            pass
+
+    class _Preds:
+        def create(self, name=None, version=None, input=None):
+            return _Pred()
+
+    class FakeClient:
+        def __init__(self, api_token=None):
+            self.predictions = _Preds()
+            self.models = types.SimpleNamespace(predictions=_Preds())
+
+    mod = types.ModuleType("replicate")
+    mod.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "replicate", mod)
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "tok")
+    monkeypatch.setattr("smoketree.backends.replicate._POLL_INTERVAL", 0)  # no real sleeping
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: gen\n    backend: replicate\n"
+        '    in:\n      p: "in/{m}.txt"\n'
+        '    out:\n      vid: "out/{m}.mp4"\n'
+        "    config:\n      model: owner/slow:v1\n      timeout: 30\n",
+    )
+    write(tmp_path, "in/alpha.txt", "go")
+    run(project)
+    assert (tmp_path / "out/alpha.mp4").read_bytes() == b"COLDBOOTBYTES"
 
 
 def test_claude_backend_runs_via_engine(tmp_path: Path, monkeypatch):
@@ -2486,7 +2712,7 @@ def test_model_ref_resolves_backend_and_merges_config(tmp_path: Path):
             '    config:\n      prompt: "write {a}"\n'
         ),
     )
-    loaded = load_pipeline(project, "g")
+    loaded = load_pipeline(project)
     r = loaded.rules[0]
     # backend comes from the def; def config is pulled in; per-rule config is preserved.
     assert r.backend == "openai"
@@ -2507,7 +2733,7 @@ def test_model_ref_rule_config_overrides_def(tmp_path: Path):
             '    config:\n      max_tokens: 256\n      prompt: "write {a}"\n'
         ),
     )
-    loaded = load_pipeline(project, "g")
+    loaded = load_pipeline(project)
     # the rule's own config wins on overlap (here it narrows max_tokens).
     assert loaded.rules[0].config["max_tokens"] == 256
 
@@ -2524,7 +2750,7 @@ def test_unknown_model_ref_rejected(tmp_path: Path):
         ),
     )
     with pytest.raises(ValidationError, match="model 'nope' is not defined"):
-        load_pipeline(project, "g")
+        load_pipeline(project)
 
 
 def test_model_and_backend_both_set_rejected(tmp_path: Path):
@@ -2540,4 +2766,4 @@ def test_model_and_backend_both_set_rejected(tmp_path: Path):
         ),
     )
     with pytest.raises(ValidationError, match="either 'model' or 'backend'"):
-        load_pipeline(project, "g")
+        load_pipeline(project)

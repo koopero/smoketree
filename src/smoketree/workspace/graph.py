@@ -96,7 +96,7 @@ def _label(rule_name: str, keys: dict[str, str]) -> str:
 
 def build_graph(project: Project, pipeline_id: str) -> Graph:
     """Enumerate every rule and instance of a pipeline with its current plan state."""
-    loaded = load_pipeline(project, pipeline_id)
+    loaded = load_pipeline(project)
     root = project.root
     state = State.load(project, pipeline_id)
     # compute_plan keys instances by binding.identity, and rule-level placeholders

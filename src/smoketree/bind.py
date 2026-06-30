@@ -243,14 +243,19 @@ def bind_rule(root: Path, rule: Rule) -> list[Binding]:
         for name, p in rule.out.items()
     }
     ctx_patterns = {name: Pattern.compile(p) for name, p in rule.context.items()}
-    list_inputs = {name for name, pat in in_patterns.items() if pat.has_glob}
-    bound_keys = {k for pat in in_patterns.values() for k in pat.keys}
+    optional = set(rule.optional)
+    # Optional inputs are always list-shaped (so absent -> []); globbed inputs are too.
+    list_inputs = {
+        name for name, pat in in_patterns.items() if pat.has_glob or name in optional
+    }
 
-    relations = [
-        (name, _match_input(root, pat)) for name, pat in in_patterns.items()
-    ]
-    # A rule with no inputs at all runs once (e.g. a pure generator); otherwise the
-    # join enumerates tuples and gates on every input being present.
+    # Required inputs gate the binding (inner-join); optional inputs are left-joined after,
+    # contributing their matching paths to each binding without dropping it when empty.
+    required = {n: p for n, p in in_patterns.items() if n not in optional}
+    relations = [(name, _match_input(root, pat)) for name, pat in required.items()]
+    optional_rows = {name: _match_input(root, in_patterns[name]) for name in optional}
+    # A rule with no required inputs runs once (e.g. a pure generator); otherwise the
+    # join enumerates tuples and gates on every required input being present.
     joins = _join(relations) if relations else [{"__keys__": {}}]
 
     bindings: list[Binding] = []
@@ -258,6 +263,17 @@ def bind_rule(root: Path, rule: Rule) -> list[Binding]:
         keys: dict[str, str] = j["__keys__"]
         inputs: dict[str, Path | list[Path]] = {}
         for name in in_patterns:
+            if name in optional:
+                # Gather every match whose keys are consistent with this binding's keys;
+                # any key the optional pattern adds beyond the spine acts as a glob.
+                paths = [
+                    p
+                    for row in optional_rows[name]
+                    if all(keys.get(k) == v for k, v in row.keys.items() if k in keys)
+                    for p in row.paths
+                ]
+                inputs[name] = sorted(set(paths))
+                continue
             paths = j[name]
             inputs[name] = paths if name in list_inputs else paths[0]
 

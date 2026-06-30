@@ -1,0 +1,25 @@
+name: file-transform
+
+defaults:
+  max_iterations: 100
+
+# A two-rule shell pipeline — the gentlest introduction to the path model.
+# The graph lives right here in smoketree.yaml (project == graph). The DAG is
+# inferred from how output patterns feed input patterns; fan-out comes from the
+# {key} axes discovered by globbing the tree. Quote any pattern with {braces}.
+rules:
+  # map: one job per {note}. Take the first line of each source note and shout it.
+  - name: headline
+    in:
+      raw: "sources/note/{note}/raw.md"
+    out:
+      headline: "work/note/{note}/headline.txt"
+    run: "head -n1 {raw} | tr a-z A-Z > {headline}"
+
+  # pool: the * glob collapses the {note} axis into a list — one combined index.
+  - name: index
+    in:
+      all: "work/note/*/headline.txt"
+    out:
+      index: "index.txt"
+    run: "cat {all} > {index}"
