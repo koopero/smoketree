@@ -1,0 +1,52 @@
+name: image-generation
+
+defaults:
+  max_iterations: 100
+  ollama_url: http://localhost:11434
+  comfyui_url: http://localhost:8188
+
+models:
+  # Step 1 — write a vivid image prompt from a short concept. Swap ollama <-> openai.
+  writer:
+    backend: ollama
+    model: gemma4:latest
+    # backend: openai
+    # model: gpt-5.1                # needs OPENAI_API_KEY
+
+  # Step 2 — render the prompt to an image. Local ComfyUI by default; swap the whole
+  # block for the OpenAI image backend (commented) to render in the cloud instead.
+  renderer:
+    backend: comfyui
+    workflow: workflows/txt2img.json
+    seed_inject: { node: "3", field: seed }
+    inputs:  { prompt: { node: "6", field: text } }
+    outputs: { image: { node: "9" } }
+    # --- OpenAI image swap: replace the five comfyui lines above with these ---
+    # backend: openai_image
+    # model: gpt-image-1            # needs OPENAI_API_KEY
+    # size: "1024x1024"
+    # prompt: "{{ prompt }}"        # openai_image builds its prompt from the input
+
+rules:
+  # map: one LLM call per concept -> a detailed image prompt.
+  - name: prompt
+    model: writer
+    in:
+      idea: "sources/concept/{concept}/idea.txt"
+    out:
+      prompt: "work/concept/{concept}/prompt.txt"
+    config:
+      prompt: |
+        Expand this concept into ONE vivid image-generation prompt: a single
+        paragraph of concrete visual detail (subject, setting, lighting, style).
+        Reply with only the prompt, no preamble.
+
+        Concept: {{ idea }}
+
+  # map: render each prompt to an image. The prompt rule feeds this one automatically.
+  - name: render
+    model: renderer
+    in:
+      prompt: "work/concept/{concept}/prompt.txt"
+    out:
+      image: "work/concept/{concept}/image.png"

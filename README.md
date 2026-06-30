@@ -250,6 +250,7 @@ Rules run through backends:
 | --- | --- |
 | `shell` | Local commands and deterministic assembly. |
 | `openai` | OpenAI chat/vision calls, with optional structured outputs. |
+| `openai_image` | OpenAI image generation / reference-image editing (gpt-image-1). |
 | `claude` | Anthropic Claude calls. |
 | `ollama` | Local LLM calls through an Ollama server. |
 | `replicate` | Hosted image, video, audio, and utility models. |

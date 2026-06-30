@@ -1,0 +1,27 @@
+name: using-schema
+
+defaults:
+  max_iterations: 100
+  ollama_url: http://localhost:11434
+
+# Same named-model switch as example 02 — swap the backend in one place.
+models:
+  writer:
+    backend: ollama
+    model: gemma4:latest          # local; or claude / openai (see README)
+
+# A schema'd output turns a free-text generation into typed, validated data.
+rules:
+  - name: listing
+    model: writer
+    in:
+      topic: "sources/item/{item}/topic.txt"
+    out:
+      listing: "work/item/{item}/listing.yaml"
+    schema:
+      listing: "schema/listing.yaml"   # constrains the model AND validates the result
+    config:
+      prompt: |
+        Create a product listing for the item described below.
+
+        Item: {{ topic }}

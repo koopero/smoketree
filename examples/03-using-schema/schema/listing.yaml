@@ -1,0 +1,21 @@
+# A JSON Schema, authored in YAML. The engine uses it two ways:
+#   1. constrains the LLM to emit JSON matching this shape;
+#   2. validates the result (and any hand-edits) before downstream rules read it.
+type: object
+additionalProperties: false
+required: [name, tagline, price_band, keywords]
+properties:
+  name:
+    type: string
+    description: A short, catchy product name.
+  tagline:
+    type: string
+    description: A one-sentence marketing tagline.
+  price_band:
+    type: string
+    enum: [budget, mid, premium]
+  keywords:
+    type: array
+    description: 3 to 5 search keywords.
+    items:
+      type: string

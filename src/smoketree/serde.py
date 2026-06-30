@@ -76,7 +76,10 @@ def write_structured(text: str, path: Path) -> None:
     decoding artifact) are pruned before writing.
     """
     try:
-        obj = json.loads(text)
+        # Constrained decoding occasionally appends trailing whitespace or a second object
+        # after the JSON value (seen with some local models). Decode the first complete
+        # value and ignore any trailing content rather than failing the whole job.
+        obj, _ = json.JSONDecoder().raw_decode(text.lstrip())
     except json.JSONDecodeError as exc:
         raise SmoketreeError(
             f"Expected JSON matching the schema, got: {text[:200]!r} ({exc})."

@@ -1,8 +1,9 @@
 """Execution backends, dispatched by a rule's ``backend`` name.
 
-All backends — ``shell``, ``ollama``, ``replicate``, ``claude``, and ``comfyui`` — are
-ported onto the PathTree ``ExecutionContext`` and read their settings from the rule's
-``config`` block (except ``shell``, which uses the rendered ``run`` command).
+All backends — ``shell``, ``ollama``, ``replicate``, ``claude``, ``openai``,
+``openai_image``, ``comfyui``, and ``explode`` — are ported onto the PathTree
+``ExecutionContext`` and read their settings from the rule's ``config`` block (except
+``shell``, which uses the rendered ``run`` command).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from .comfyui import ComfyUIBackend
 from .explode import ExplodeBackend
 from .ollama import OllamaBackend
 from .openai import OpenAIBackend
+from .openai_image import OpenAIImageBackend
 from .replicate import ReplicateBackend
 from .shell import ShellBackend
 
@@ -23,6 +25,7 @@ _BACKENDS: dict[str, type[Backend]] = {
     "replicate": ReplicateBackend,
     "claude": ClaudeBackend,
     "openai": OpenAIBackend,
+    "openai_image": OpenAIImageBackend,
     "comfyui": ComfyUIBackend,
     "explode": ExplodeBackend,
 }

@@ -134,6 +134,5 @@ the affected cells, so the next `run` regenerates them.)
 
 ## Next
 
-**03 · Using Schema** *(planned)* — constrain the model to emit structured data
-(JSON Schema) and validate it on the way out. See the
-[examples roadmap](../README.md).
+**[03 · Using Schema](../03-using-schema/)** — constrain the model to emit structured data
+(JSON Schema) and validate it on the way out.

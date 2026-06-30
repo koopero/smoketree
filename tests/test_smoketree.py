@@ -1657,6 +1657,47 @@ def test_ollama_backend_runs_via_engine(tmp_path: Path, monkeypatch):
     assert "seed" in posted["options"]  # deterministic seed injected
 
 
+def test_openai_image_backend_writes_png(tmp_path: Path, monkeypatch):
+    import base64
+    import sys
+    import types
+
+    captured: dict = {}
+    fake_png = b"\x89PNG\r\n\x1a\nFAKEIMAGE"
+    b64 = base64.b64encode(fake_png).decode()
+
+    class FakeImages:
+        def generate(self, **kwargs):
+            captured.update(kwargs)
+            return types.SimpleNamespace(
+                data=[types.SimpleNamespace(b64_json=b64, url=None)]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, *a, **k):
+            self.images = FakeImages()
+
+    fake = types.ModuleType("openai")
+    fake.OpenAI = FakeOpenAI
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: render\n    backend: openai_image\n"
+        '    in:\n      prompt: "work/{m}/prompt.txt"\n'
+        '    out:\n      image: "work/{m}/image.png"\n'
+        '    config:\n      model: gpt-image-1\n      size: "1024x1024"\n'
+        '      prompt: "{{ prompt }}"\n',
+    )
+    write(tmp_path, "work/alpha/prompt.txt", "a neon harbor at dawn\n")
+    run(project)
+
+    assert (tmp_path / "work/alpha/image.png").read_bytes() == fake_png
+    assert captured["prompt"].strip() == "a neon harbor at dawn"
+    assert captured["size"] == "1024x1024" and captured["model"] == "gpt-image-1"
+
+
 def test_replicate_build_input_maps_fields(tmp_path: Path):
     from smoketree.backends.base import ExecutionContext
     from smoketree.backends.replicate import ReplicateBackend
