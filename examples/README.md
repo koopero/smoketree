@@ -23,7 +23,7 @@ uv run smoketree run
 | 05 | [Image editing](05-image-editing/) | combine reference images + a prompt | `comfyui`/`openai_image` | ✅ built |
 | 06 | [Feedback loops](06-feedback-loops/) | refine artifacts from human notes | `ollama` + `feedback` | ✅ built |
 | 07 | [Brainstorm loop](07-brainstorm-loop/) | recurring idea engines without self-feeding | `ollama` + `context`/`trigger`/`explode` | ✅ built |
-| 08 | Gating | curate artifacts with a human in the loop | `filter` + `select` | 🚧 planned |
+| 08 | [Gating](08-gating/) | curate artifacts with a human in the loop | `shell` + `filter`/`select` | ✅ built |
 | 09 | Working files | human-edited files inside the system | `author` + reconcile | 🚧 planned |
 
 ## Conventions these examples follow

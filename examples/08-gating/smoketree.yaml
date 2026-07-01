@@ -1,0 +1,43 @@
+name: gating
+
+defaults:
+  max_iterations: 100
+
+# Curate a set of candidates with a human in the loop. A `select` feedback channel lets a
+# reviewer set each candidate's status; a `filter` rule projects only the approved ones
+# forward, so everything downstream sees the curated subset — never the rejects.
+rules:
+  # Surface each candidate for review and attach the human channels (status + notes).
+  - name: review
+    in:
+      idea: "sources/candidate/{candidate}/idea.md"
+    out:
+      card: "work/candidate/{candidate}/card.md"
+    run: "cp {idea} {card}"
+    feedback:
+      - name: status
+        path: "review/candidate/{candidate}/status.yaml"
+        kind: select
+        options: [pending, approve, reject]
+        describe: "Approve to advance this candidate."
+      - name: notes
+        path: "review/candidate/{candidate}/notes.md"
+        describe: "Why keep or drop this one?"
+
+  # Gate: keep only candidates whose status is `approve`; drop the rest from the set.
+  - name: gate
+    in:
+      idea:   "sources/candidate/{candidate}/idea.md"
+      status: "review/candidate/{candidate}/status.yaml"
+    out:
+      approved: "approved/{candidate}/idea.md"
+    filter: { input: status, field: status, equals: approve }
+    run: "cp {idea} {approved}"
+
+  # Downstream only ever globs approved/* — assemble the curated shortlist.
+  - name: shortlist
+    in:
+      approved: "approved/*/idea.md"
+    out:
+      list: "shortlist.md"
+    run: "cat {approved} > {list}"

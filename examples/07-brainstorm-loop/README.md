@@ -108,5 +108,5 @@ above, this is the example where that swap most changes the *quality* of the res
 
 ## Next
 
-**08 · Gating** *(planned)* — a human approves which pooled ideas advance, using a `select`
-feedback channel and a `filter`. See the [examples roadmap](../README.md).
+**[08 · Gating](../08-gating/)** — a human approves which pooled ideas advance, using a
+`select` feedback channel and a `filter`.
