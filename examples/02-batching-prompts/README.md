@@ -7,8 +7,8 @@
 
 - **Batching.** A single rule fans one prompt template across every `{item}` discovered
   on disk — the same path-model fan-out as example 1, now driving a model.
-- **Named models.** The backend + model are defined once in a top-level `models:` block;
-  the rule just references it. Switching Ollama → Claude → OpenAI is a one-block edit.
+- **Named models.** Each backend is a named def in the `models:` block; the rule references
+  one with `model:`. Switching Ollama → Claude → OpenAI is a one-line change.
 - **Prompt templating.** Inputs are exposed to the prompt as Jinja2 variables
   (`{{ topic }}`).
 - **Caching applies to model calls too.** An unchanged input never re-calls the model;
@@ -38,14 +38,11 @@ work/item/{item}/blurb.txt      one blurb per item
 ## The pipeline
 
 ```yaml
-models:
-  writer:
-    backend: ollama
-    model: gemma4:latest          # the one place the backend/model is chosen
-
 rules:
   - name: blurb
-    model: writer                 # backend + model come from the def above
+    model: writer_ollama          # pick a backend def; the others are commented below
+    # model: writer_claude
+    # model: writer_openai
     in:
       topic: "sources/item/{item}/topic.txt"
     out:
@@ -56,14 +53,19 @@ rules:
         Reply with only the sentence, no preamble.
 
         Item: {{ topic }}
+
+models:
+  writer_ollama: { backend: ollama, model: gemma4:latest }
+  writer_claude: { backend: claude, model: claude-opus-4-8 }
+  writer_openai: { backend: openai, model: gpt-5.1 }
 ```
 
 - `{item}` is the fan-out **key**: one model call per `sources/item/<item>/topic.txt`.
-- The `writer` def under `models:` names the backend (`ollama`, routed to the local server
-  via `ollama_url` in `defaults`) and the model. The rule points at it with `model: writer`
-  instead of carrying its own `backend:`.
+- Each backend is its own named def under `models:`. The rule points at one with
+  `model: writer_ollama` (which names the backend — `ollama`, routed to the local server via
+  `ollama_url` in `defaults` — and the model) instead of carrying its own `backend:`.
 - A rule's own `config:` merges **under** the def, so per-rule bits — here the `prompt` —
-  live on the rule while the shared backend/model lives in one place. (A rule sets *either*
+  live on the rule while the shared backend/model lives in the def. (A rule sets *either*
   `model:` *or* `backend:`, never both.)
 - The prompt is a **Jinja2 template**. Each `in:` port is available by name: `topic` is a
   text file, so `{{ topic }}` inlines its contents. (Data inputs — `.yaml`/`.json` — would
@@ -111,26 +113,22 @@ resumes from 300, and tweaking one source re-spends exactly one call.
 
 ## Swapping backends
 
-Because the backend lives in the `writer` def, switching providers is a one-block edit —
-the rule, `in`, `out`, and `prompt` never change. Edit `models.writer` in `smoketree.yaml`:
+Each backend is its own def, so switching providers is a **one-line change** — flip which
+`model:` line is commented in the `blurb` rule. The rule, `in`, `out`, and `prompt` never
+change:
 
 ```yaml
-models:
-  writer:
-    # backend: ollama
-    # model: gemma4:latest        # local, no key, no cost
-
-    backend: claude
-    model: claude-opus-4-8        # needs ANTHROPIC_API_KEY
-
-    # backend: openai
-    # model: gpt-5.1              # needs OPENAI_API_KEY
+rules:
+  - name: blurb
+    # model: writer_ollama
+    model: writer_claude          # needs ANTHROPIC_API_KEY
+    # model: writer_openai
 ```
 
-Set an API key (in a `.env` beside `smoketree.yaml`, or the environment) and re-run —
-every rule that references `writer` now calls the new provider. That's the payoff of named
-models: one switch point no matter how many rules share it. (The change to the def re-stales
-the affected cells, so the next `run` regenerates them.)
+Set the matching API key (in a `.env` beside `smoketree.yaml`, or the environment) and
+re-run. That's the payoff of named defs: the alternatives stay valid and ready, so swapping
+is a reference change, not a rewrite. The switch re-stales the affected cells, so the next
+`run` regenerates them.
 
 ## Next
 

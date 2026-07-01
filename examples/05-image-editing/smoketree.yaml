@@ -1,0 +1,36 @@
+name: image-editing
+
+defaults:
+  max_iterations: 100
+  comfyui_url: http://localhost:8188
+
+rules:
+  # map: one edit per subject. The reference image and the instruction both feed the editor.
+  - name: edit
+    model: editor_comfyui_flux2
+    # model: editor_openai
+    in:
+      reference:   "sources/subject/{subject}/ref.png"
+      instruction: "sources/edit.txt"             # one instruction, broadcast to every subject
+    out:
+      image: "work/subject/{subject}/edited.png"
+
+models:
+  # An image editor: a reference image + a text instruction -> an edited image. One named
+  # def per backend; the rule above picks one with `model:` (local Flux 2 Klein by default).
+  editor_comfyui_flux2:
+    backend: comfyui
+    workflow: workflows/flux2-edit.json
+    timeout: 1200                                  # Flux 2 Klein is heavier than SD models
+    seed_inject: { node: "138", field: noise_seed }
+    inputs:
+      reference:   { node: "76",  field: image }   # the LoadImage node
+      instruction: { node: "141", field: text }    # the positive prompt
+    outputs: { image: { node: "9" } }
+
+  # Alternative editor — flip the two `model:` lines in the rule above to use this instead.
+  editor_openai:
+    backend: openai_image
+    model: gpt-image-1            # needs OPENAI_API_KEY
+    size: "1024x1024"
+    prompt: "{{ instruction }}"   # the `reference` image input is sent as the edit base

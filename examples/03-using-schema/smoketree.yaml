@@ -4,16 +4,12 @@ defaults:
   max_iterations: 100
   ollama_url: http://localhost:11434
 
-# Same named-model switch as example 02 — swap the backend in one place.
-models:
-  writer:
-    backend: ollama
-    model: gemma4:latest          # local; or claude / openai (see README)
-
 # A schema'd output turns a free-text generation into typed, validated data.
 rules:
   - name: listing
-    model: writer
+    model: writer_ollama          # flip the model: lines below to switch backend
+    # model: writer_claude
+    # model: writer_openai
     in:
       topic: "sources/item/{item}/topic.txt"
     out:
@@ -25,3 +21,16 @@ rules:
         Create a product listing for the item described below.
 
         Item: {{ topic }}
+
+# One named def per backend; the rule picks one with `model:`. Hosted models (claude,
+# openai) honor JSON Schema natively, so the schema block above is unchanged when you swap.
+models:
+  writer_ollama:
+    backend: ollama
+    model: gemma4:latest          # local, no key, no cost (needs `ollama serve`)
+  writer_claude:
+    backend: claude
+    model: claude-opus-4-8        # needs ANTHROPIC_API_KEY
+  writer_openai:
+    backend: openai
+    model: gpt-5.1                # needs OPENAI_API_KEY

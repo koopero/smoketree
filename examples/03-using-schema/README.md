@@ -39,7 +39,7 @@ work/item/{item}/listing.yaml   typed, schema-valid product data
 ```yaml
 rules:
   - name: listing
-    model: writer                          # the named model def (see example 02)
+    model: writer_ollama                   # named backend def; swap by flipping model: (see example 02)
     in:
       topic: "sources/item/{item}/topic.txt"
     out:
@@ -117,9 +117,10 @@ both malformed generations and bad hand-edits before any downstream rule reads t
 
 ## Swapping backends
 
-Identical to [example 02](../02-batching-prompts/#swapping-backends): the backend lives in
-the `writer` def, so switching to `claude` (`claude-opus-4-8`) or `openai` (`gpt-5.1`) is a
-one-block edit. Hosted models honor JSON Schema natively; the `schema:` block is unchanged.
+Identical to [example 02](../02-batching-prompts/#swapping-backends): one named def per
+backend (`writer_ollama` / `writer_claude` / `writer_openai`), and you switch by flipping
+which `model:` line is commented in the `listing` rule. Hosted models honor JSON Schema
+natively, so the `schema:` block is unchanged when you swap.
 
 ## Next
 

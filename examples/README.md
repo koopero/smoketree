@@ -20,7 +20,7 @@ uv run smoketree run
 | 02 | [Batching prompts](02-batching-prompts/) | one prompt template fanned across inputs | `ollama` | ✅ built |
 | 03 | [Using schema](03-using-schema/) | structured output constrained + validated by JSON Schema | `ollama` | ✅ built |
 | 04 | [Image generation](04-image-generation/) | prompt prebuilding → image model | `ollama` + `comfyui` | ✅ built |
-| 05 | Image editing | combine reference images + a prompt | `comfyui`/`openai_image` | 🚧 planned |
+| 05 | [Image editing](05-image-editing/) | combine reference images + a prompt | `comfyui`/`openai_image` | ✅ built |
 | 06 | Feedback loops | refine artifacts from human notes | LLM + `feedback` | 🚧 planned |
 | 07 | Brainstorm loop | recurring idea engines without self-feeding | `context` + `trigger` | 🚧 planned |
 | 08 | Gating | curate artifacts with a human in the loop | `filter` + `select` | 🚧 planned |
