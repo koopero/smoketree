@@ -1,0 +1,52 @@
+name: brainstorm-loop
+
+defaults:
+  max_iterations: 100
+  ollama_url: http://localhost:11434
+
+rules:
+  # Each round marker fires ONE brainstorming batch. The growing idea pool is read as
+  # `context` — an ambient input excluded from staleness — so the pool filling up never
+  # re-triggers this rule. New ideas come only from a new round marker.
+  - name: ideate
+    model: writer_ollama
+    # model: writer_claude          # a frontier model really earns its keep here (diversity)
+    # model: writer_openai
+    in:
+      go: "rounds/{round}/go.txt"
+    context:
+      seen: "pool/*/idea.yaml"
+    out:
+      batch: "work/rounds/{round}/batch.yaml"
+    schema:
+      batch: "schema/batch.yaml"
+    trigger:
+      marker: "rounds/{round}/go.txt"
+      describe: "Brainstorm another batch"
+      content: "go\n"
+    config:
+      prompt: |
+        You run a shop of "delightfully useless gadgets". Invent 4 fresh, distinct product
+        ideas — each a short title and a one-line hook.
+
+        Do NOT repeat or lightly reword any of these existing ideas:
+        {% for s in seen %}- {{ s.title }}
+        {% endfor %}
+
+  # Fan the batch into the flat idea pool, one directory per idea. `protect` never
+  # overwrites a pooled idea, so the pool only ever grows.
+  - name: collect
+    backend: explode
+    in:
+      batch: "work/rounds/{round}/batch.yaml"
+    out:
+      idea: "pool/{slug}/idea.yaml"
+    config:
+      items: ideas
+      key: title
+      protect: "pool/{slug}/idea.yaml"
+
+models:
+  writer_ollama: { backend: ollama, model: gemma4:latest }
+  writer_claude: { backend: claude, model: claude-opus-4-8 }
+  writer_openai: { backend: openai, model: gpt-5.1 }

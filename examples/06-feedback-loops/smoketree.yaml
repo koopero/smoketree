@@ -1,0 +1,51 @@
+name: feedback-loops
+
+defaults:
+  max_iterations: 100
+  ollama_url: http://localhost:11434
+
+rules:
+  # Distill the human's review notes into one concise directive. On the first run the notes
+  # file is just the seeded placeholder, so this yields "(no direction)".
+  - name: distill
+    model: writer_ollama          # flip the model: lines below to switch backend
+    # model: writer_claude
+    # model: writer_openai
+    in:
+      notes: "feedback/product/{product}/notes.md"
+    out:
+      directive: "work/product/{product}/directive.txt"
+    config:
+      prompt: |
+        Turn these review notes into ONE concise art-direction directive for a tagline
+        writer. If there is no real feedback, reply with exactly "(no direction)".
+
+        Notes: {{ notes }}
+
+  # Write the tagline from the brief, following the distilled directive. This rule owns the
+  # human feedback channel: a notes file seeded beside its output, never clobbered.
+  - name: tagline
+    model: writer_ollama          # flip the model: lines below to switch backend
+    # model: writer_claude
+    # model: writer_openai
+    in:
+      brief:     "sources/product/{product}/brief.txt"
+      directive: "work/product/{product}/directive.txt"
+    out:
+      tagline: "work/product/{product}/tagline.txt"
+    feedback:
+      - name: notes
+        path: "feedback/product/{product}/notes.md"
+        describe: "How should this tagline change?"
+    config:
+      prompt: |
+        Write a single punchy tagline (under 8 words) for this product, following the art
+        direction. Reply with only the tagline, no quotes.
+
+        Product: {{ brief }}
+        Art direction: {{ directive }}
+
+models:
+  writer_ollama: { backend: ollama, model: gemma4:latest }
+  writer_claude: { backend: claude, model: claude-opus-4-8 }
+  writer_openai: { backend: openai, model: gpt-5.1 }

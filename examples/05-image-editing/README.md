@@ -125,5 +125,5 @@ alternative to the local Flux 2 path, no GPU required.
 
 ## Next
 
-**06 · Feedback Loops** *(planned)* — record human notes on a rendered cell and fold them
-back into the next pass. See the [examples roadmap](../README.md).
+**[06 · Feedback Loops](../06-feedback-loops/)** — record human notes on a cell and fold them
+back into the next pass, refining only what you touched.

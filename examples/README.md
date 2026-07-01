@@ -21,8 +21,8 @@ uv run smoketree run
 | 03 | [Using schema](03-using-schema/) | structured output constrained + validated by JSON Schema | `ollama` | ✅ built |
 | 04 | [Image generation](04-image-generation/) | prompt prebuilding → image model | `ollama` + `comfyui` | ✅ built |
 | 05 | [Image editing](05-image-editing/) | combine reference images + a prompt | `comfyui`/`openai_image` | ✅ built |
-| 06 | Feedback loops | refine artifacts from human notes | LLM + `feedback` | 🚧 planned |
-| 07 | Brainstorm loop | recurring idea engines without self-feeding | `context` + `trigger` | 🚧 planned |
+| 06 | [Feedback loops](06-feedback-loops/) | refine artifacts from human notes | `ollama` + `feedback` | ✅ built |
+| 07 | [Brainstorm loop](07-brainstorm-loop/) | recurring idea engines without self-feeding | `ollama` + `context`/`trigger`/`explode` | ✅ built |
 | 08 | Gating | curate artifacts with a human in the loop | `filter` + `select` | 🚧 planned |
 | 09 | Working files | human-edited files inside the system | `author` + reconcile | 🚧 planned |
 

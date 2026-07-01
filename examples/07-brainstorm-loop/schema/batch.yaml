@@ -1,0 +1,15 @@
+# One batch of brainstormed ideas. The LLM output is constrained to this shape, and the
+# `collect` rule fans the `ideas` array into one pooled file per idea.
+type: object
+additionalProperties: false
+required: [ideas]
+properties:
+  ideas:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [title, hook]
+      properties:
+        title: { type: string }
+        hook:  { type: string }
