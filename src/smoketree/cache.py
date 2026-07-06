@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +42,11 @@ class JobState:
     completed_at: str
     # cheap mtime+size fingerprint of the inputs at record time; gates the content hash
     fingerprint: str = ""
+    # the binding's managed outputs at record time — kept so a binding that stops
+    # enumerating entirely (a required input vanished) can still have its previously
+    # produced outputs cleaned up, the same way a `filter` mismatch does.
+    enumerable_outputs: list[str] = field(default_factory=list)
+    owned_prefixes: list[str] = field(default_factory=list)
 
 
 class State:
@@ -66,19 +71,30 @@ class State:
                     input_hash=raw["input_hash"],
                     completed_at=raw.get("completed_at", ""),
                     fingerprint=raw.get("fingerprint", ""),
+                    enumerable_outputs=raw.get("enumerable_outputs", []),
+                    owned_prefixes=raw.get("owned_prefixes", []),
                 )
         return state
 
     def get(self, identity: str) -> JobState | None:
         return self.jobs.get(identity)
 
-    def record(self, identity: str, input_hash: str, fingerprint: str = "") -> None:
+    def record(
+        self,
+        identity: str,
+        input_hash: str,
+        fingerprint: str = "",
+        enumerable_outputs: list[str] | None = None,
+        owned_prefixes: list[str] | None = None,
+    ) -> None:
         self.jobs[identity] = JobState(
             input_hash=input_hash,
             completed_at=datetime.now(timezone.utc)
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
             fingerprint=fingerprint,
+            enumerable_outputs=enumerable_outputs or [],
+            owned_prefixes=owned_prefixes or [],
         )
 
     def touch_fingerprint(self, identity: str, fingerprint: str) -> None:
@@ -102,6 +118,8 @@ class State:
                     "input_hash": js.input_hash,
                     "completed_at": js.completed_at,
                     "fingerprint": js.fingerprint,
+                    "enumerable_outputs": js.enumerable_outputs,
+                    "owned_prefixes": js.owned_prefixes,
                 }
                 for identity, js in sorted(self.jobs.items())
             }

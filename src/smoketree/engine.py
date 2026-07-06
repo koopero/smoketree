@@ -388,6 +388,40 @@ def _drop(binding: Binding, state: State, report: Reporter) -> bool:
     return removed
 
 
+def _sweep_orphans(rule, current_ids: set[str], state: State, report: Reporter) -> bool:
+    """Drop managed outputs recorded for a rule's bindings that no longer enumerate.
+
+    A binding can vanish from ``bind_rule``'s output entirely — not just fail its own
+    ``filter`` — when a required input disappears (e.g. an upstream rule's filter just
+    dropped the file it points at). The inner join simply yields no row for that
+    key-tuple, so it never reaches the per-binding filter/staleness checks below. This
+    sweeps the state file for exactly that gap: a previously recorded job for this rule
+    whose identity isn't among the bindings enumerable this pass.
+
+    Returns whether anything was removed on disk (so the caller can re-plan downstream,
+    the same as ``_drop``).
+    """
+    prefix = f"{rule.name}("
+    orphans = [i for i in state.jobs if i.startswith(prefix) and i not in current_ids]
+    removed = False
+    for identity in orphans:
+        job = state.jobs[identity]
+        for rel in job.enumerable_outputs:
+            path = Path(rel)
+            if path.exists() or path.is_symlink():
+                path.unlink()
+                report(f"  drop   {path}")
+                removed = True
+        for rel in job.owned_prefixes:
+            path = Path(rel)
+            if path.is_dir():
+                shutil.rmtree(path)
+                report(f"  drop   {path}")
+                removed = True
+        state.discard(identity)
+    return removed
+
+
 def _newest_mtime(path: Path) -> float:
     if path.is_file():
         return path.stat().st_mtime
@@ -456,14 +490,18 @@ def run(
     for iteration in range(1, max_iter + 1):
         _seed_feedback(project, loaded, report)
         _seed_authored(project, loaded, report)
-        bindings = [
-            b
-            for rule in loaded.rules
-            if rule.enabled and (only is None or rule.name in only)
-            for b in bind_rule(project.root, rule)
-            if _where_match(b, where)
-        ]
         progressed = False
+        bindings: list[Binding] = []
+        for rule in loaded.rules:
+            if not rule.enabled or (only is not None and rule.name not in only):
+                continue
+            rule_bindings = bind_rule(project.root, rule)
+            # Orphan sweep uses the full (pre-`where`) enumeration: `where` just narrows
+            # what runs this invocation, it doesn't mean those bindings no longer exist.
+            if _sweep_orphans(rule, {b.identity for b in rule_bindings}, state, report):
+                state.save()
+                progressed = True
+            bindings.extend(b for b in rule_bindings if _where_match(b, where))
         for binding in bindings:
             if not _inputs_present(binding):
                 continue  # inputs pruned earlier this pass; re-evaluated next pass
@@ -482,7 +520,11 @@ def run(
             run_start = time.time()
             _execute(project, binding, report)
             state.record(
-                binding.identity, _input_hash(binding), _input_fingerprint(binding)
+                binding.identity,
+                _input_hash(binding),
+                _input_fingerprint(binding),
+                enumerable_outputs=[str(p) for p in binding.enumerable_outputs],
+                owned_prefixes=[str(p) for p in binding.owned_prefixes],
             )
             # Persist after every job: an expensive run that fails partway (a paid
             # render, a throttle) must not lose — or re-bill — the work already done.
@@ -525,9 +567,18 @@ def compute_plan(
         if not rule.enabled:
             entries.append(PlanEntry(rule.name, "OFF", "disabled"))
             continue
-        bindings = [b for b in bind_rule(project.root, rule) if _where_match(b, where)]
+        all_bindings = bind_rule(project.root, rule)
+        current_ids = {b.identity for b in all_bindings}
+        prefix = f"{rule.name}("
+        orphans = sorted(
+            i for i in state.jobs if i.startswith(prefix) and i not in current_ids
+        )
+        for identity in orphans:
+            entries.append(PlanEntry(identity, "DROP", "inputs no longer satisfiable"))
+        bindings = [b for b in all_bindings if _where_match(b, where)]
         if not bindings:
-            entries.append(PlanEntry(rule.name, "PENDING", "no inputs yet"))
+            if not orphans:
+                entries.append(PlanEntry(rule.name, "PENDING", "no inputs yet"))
             continue
         for binding in bindings:
             if rule.filter is not None and (

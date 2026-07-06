@@ -615,6 +615,54 @@ def test_filter_drops_output_when_unapproved(tmp_path: Path):
     assert (tmp_path / "approved/alpha/seed.yaml").exists()
 
 
+CHAIN_PIPE = (
+    "name: g\nrules:\n"
+    "  - name: approve\n"
+    '    in:\n      seed: "ideas/{idea}/seed.yaml"\n'
+    '      status: "ideas/{idea}/status.yaml"\n'
+    '    out:\n      sel: "approved/{idea}/seed.yaml"\n'
+    "    filter: { input: status, field: status, equals: approve }\n"
+    '    run: "cp {seed} {sel}"\n'
+    "  - name: stamp\n"
+    '    in:\n      sel: "approved/{idea}/seed.yaml"\n'
+    '    out:\n      stamped: "stamped/{idea}/seed.yaml"\n'
+    '    run: "cp {sel} {stamped}"\n'
+)
+
+
+def test_orphaned_downstream_output_dropped_when_required_input_vanishes(tmp_path: Path):
+    """`stamp` carries no filter of its own, but its required input is `approve`'s managed,
+    filtered output. When `approve`'s filter drops that output, `stamp` stops enumerating a
+    binding entirely (the inner join yields no row) — it must not just sit reported as
+    PENDING while its own previously-produced output lingers, stale, on disk."""
+    project = make_project(tmp_path, CHAIN_PIPE)
+    _ideas(tmp_path, alpha="approve")
+    run(project)
+    assert (tmp_path / "approved/alpha/seed.yaml").exists()
+    assert (tmp_path / "stamped/alpha/seed.yaml").exists()
+
+    # Un-approve, but run only `approve` — isolates its filter-drop from `stamp` ever
+    # having a chance to react in the same pass.
+    write(tmp_path, "ideas/alpha/status.yaml", "status: ignore\n")
+    loaded = load_pipeline(project)
+    enginelib.run(project, loaded, only={"approve"})
+    assert not (tmp_path / "approved/alpha/seed.yaml").exists()
+    assert (tmp_path / "stamped/alpha/seed.yaml").exists()  # still stale on disk
+
+    plan = enginelib.compute_plan(project, loaded)
+    stamp_entries = [e for e in plan if e.identity.startswith("stamp(")]
+    assert stamp_entries and all(e.action == "DROP" for e in stamp_entries)
+
+    enginelib.run(project, loaded)
+    assert not (tmp_path / "stamped/alpha/seed.yaml").exists()
+
+    # Re-approving brings both back.
+    write(tmp_path, "ideas/alpha/status.yaml", "status: approve\n")
+    assert enginelib.run(project, loaded) == 2
+    assert (tmp_path / "approved/alpha/seed.yaml").exists()
+    assert (tmp_path / "stamped/alpha/seed.yaml").exists()
+
+
 def test_filter_among(tmp_path: Path):
     project = make_project(
         tmp_path,
@@ -1070,6 +1118,31 @@ def test_reroll_counter_forces_rerun(tmp_path: Path):
     (tmp_path / "work/p.txt.roll").write_text("1\n")
     assert run(project) == 1
     assert run(project) == 0  # stable again at the new roll
+
+
+def test_cli_reroll_scoped_does_not_touch_other_bindings(tmp_path: Path, monkeypatch):
+    """`smoketree reroll -w ...` must stay scoped end-to-end, including its trailing
+    re-run — it must not fall through to re-executing the whole unscoped project."""
+    from typer.testing import CliRunner
+
+    from smoketree.cli import app
+
+    project = make_project(tmp_path, REROLL_SHELL_PIPE)
+    write(tmp_path, "src/alpha.txt", "a1\n")
+    write(tmp_path, "src/beta.txt", "b1\n")
+    assert run(project) == 2  # both bindings fully rendered once
+
+    # beta has unrelated, legitimately-pending work (its source changed since last run) —
+    # a scoped reroll of alpha must not sweep this up.
+    write(tmp_path, "src/beta.txt", "b2\n")
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["reroll", "-w", "m=alpha"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "work/alpha.txt.roll").exists()  # alpha was bumped + re-rendered
+    assert not (tmp_path / "work/beta.txt.roll").exists()  # beta untouched
+    assert (tmp_path / "work/beta.txt").read_text() == "b1\n"  # beta's stale source not picked up
 
 
 def test_bump_roll_increments(tmp_path: Path):

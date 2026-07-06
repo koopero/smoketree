@@ -198,7 +198,7 @@ def reroll(
         )
         return
     try:
-        enginelib.run(project, loaded, report=typer.echo)
+        enginelib.run(project, loaded, only=only, where=sel, report=typer.echo)
     except SmoketreeError as exc:
         _fail(str(exc))
         return
