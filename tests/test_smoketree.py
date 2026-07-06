@@ -2881,3 +2881,193 @@ def test_model_and_backend_both_set_rejected(tmp_path: Path):
     )
     with pytest.raises(ValidationError, match="either 'model' or 'backend'"):
         load_pipeline(project)
+
+
+# --------------------------------------------------------------------------- #
+# Backend: blender (mocked subprocess — no real Blender)
+# --------------------------------------------------------------------------- #
+
+
+def _fake_blender_run(job_writer=None, returncode=0, stdout="", stderr=""):
+    """A fake subprocess.run for the blender backend: reads the job JSON off
+    SMOKETREE_JOB, optionally lets ``job_writer(job, outputs)`` write output files, and
+    returns a fake CompletedProcess."""
+    import json as _json
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def fake_run(command, cwd, env, capture_output, text, timeout):
+        captured["command"] = command
+        captured["env"] = env
+        job = _json.loads(Path(env["SMOKETREE_JOB"]).read_text())
+        captured["job"] = job
+        if job_writer is not None:
+            job_writer(job)
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    return fake_run, captured
+
+
+def test_blender_one_value_parses_data_else_passes_path(tmp_path: Path):
+    from smoketree.backends.blender import BlenderBackend
+
+    yaml_path = write(tmp_path, "weave.yaml", "- a\n- b\n")
+    mesh_path = write(tmp_path, "model.glb", "not really glb bytes")
+
+    assert BlenderBackend._one_value(yaml_path) == ["a", "b"]
+    assert BlenderBackend._one_value(mesh_path) == str(mesh_path)
+
+
+def test_blender_job_value_handles_lists_and_scalars(tmp_path: Path):
+    from smoketree.backends.blender import BlenderBackend
+
+    a = write(tmp_path, "shot/a/clip.mp4", "x")
+    b = write(tmp_path, "shot/b/clip.mp4", "x")
+
+    assert BlenderBackend._job_value(a) == str(a)
+    assert BlenderBackend._job_value([a, b]) == [str(a), str(b)]
+    assert BlenderBackend._job_value([]) == []
+
+
+def test_blender_backend_runs_via_engine(tmp_path: Path, monkeypatch):
+    def write_blend(job):
+        Path(job["outputs"]["blend"]).write_bytes(b"BLENDFAKE")
+
+    fake_run, captured = _fake_blender_run(job_writer=write_blend)
+    monkeypatch.setattr("smoketree.backends.blender.subprocess.run", fake_run)
+    monkeypatch.setenv("BLENDER_PATH", "/fake/blender")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: to_blend\n    backend: blender\n"
+        '    in:\n      mesh: "work/{m}/model.glb"\n'
+        '    out:\n      blend: "work/{m}/model.blend"\n'
+        '    config:\n      script: "scripts/glb_to_blend.py"\n',
+    )
+    write(tmp_path, "scripts/glb_to_blend.py", "# bpy script (not actually run)\n")
+    write(tmp_path, "work/alpha/model.glb", "glb bytes")
+    run(project)
+
+    assert (tmp_path / "work/alpha/model.blend").read_bytes() == b"BLENDFAKE"
+    assert captured["job"]["inputs"]["mesh"] == str(tmp_path / "work/alpha/model.glb")
+    assert captured["command"][0] == "/fake/blender"
+    assert "--background" in captured["command"]
+    assert captured["env"]["SMOKETREE_KEY_M"] == "alpha"
+
+
+def test_blender_backend_data_input_embedded_as_parsed_structure(tmp_path: Path, monkeypatch):
+    def write_blend(job):
+        assert job["inputs"]["weave"] == ["a", "b"]  # parsed, not a path string
+        Path(job["outputs"]["blend"]).write_bytes(b"BLENDFAKE")
+
+    fake_run, captured = _fake_blender_run(job_writer=write_blend)
+    monkeypatch.setattr("smoketree.backends.blender.subprocess.run", fake_run)
+    monkeypatch.setenv("BLENDER_PATH", "/fake/blender")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: weave_video\n    backend: blender\n"
+        '    in:\n      weave: "songs/{s}/weave.yaml"\n'
+        '    out:\n      blend: "songs/{s}/video.blend"\n'
+        '    config:\n      script: "scripts/build_timeline.py"\n',
+    )
+    write(tmp_path, "scripts/build_timeline.py", "# bpy script (not actually run)\n")
+    write(tmp_path, "songs/song1/weave.yaml", "- a\n- b\n")
+    run(project)
+    assert (tmp_path / "songs/song1/video.blend").read_bytes() == b"BLENDFAKE"
+
+
+def test_blender_backend_missing_script_raises(tmp_path: Path):
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: to_blend\n    backend: blender\n"
+        '    in:\n      mesh: "work/{m}/model.glb"\n'
+        '    out:\n      blend: "work/{m}/model.blend"\n'
+        '    config:\n      script: "scripts/nope.py"\n',
+    )
+    write(tmp_path, "work/alpha/model.glb", "glb bytes")
+    with pytest.raises(ExecutionError, match="not found"):
+        run(project)
+
+
+def test_blender_backend_no_executable_found_raises(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("BLENDER_PATH", raising=False)
+    monkeypatch.setattr("smoketree.backends.blender.shutil.which", lambda name: None)
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: to_blend\n    backend: blender\n"
+        '    in:\n      mesh: "work/{m}/model.glb"\n'
+        '    out:\n      blend: "work/{m}/model.blend"\n'
+        '    config:\n      script: "scripts/glb_to_blend.py"\n',
+    )
+    write(tmp_path, "scripts/glb_to_blend.py", "# bpy script\n")
+    write(tmp_path, "work/alpha/model.glb", "glb bytes")
+    with pytest.raises(ExecutionError, match="No Blender executable"):
+        run(project)
+
+
+def test_blender_backend_nonzero_exit_raises_with_output_tail(tmp_path: Path, monkeypatch):
+    fake_run, _ = _fake_blender_run(returncode=1, stdout="out line", stderr="boom")
+    monkeypatch.setattr("smoketree.backends.blender.subprocess.run", fake_run)
+    monkeypatch.setenv("BLENDER_PATH", "/fake/blender")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: to_blend\n    backend: blender\n"
+        '    in:\n      mesh: "work/{m}/model.glb"\n'
+        '    out:\n      blend: "work/{m}/model.blend"\n'
+        '    config:\n      script: "scripts/glb_to_blend.py"\n',
+    )
+    write(tmp_path, "scripts/glb_to_blend.py", "# bpy script\n")
+    write(tmp_path, "work/alpha/model.glb", "glb bytes")
+    with pytest.raises(ExecutionError, match="boom"):
+        run(project)
+
+
+def test_blender_backend_missing_declared_output_raises(tmp_path: Path, monkeypatch):
+    fake_run, _ = _fake_blender_run()  # exits 0 but writes nothing
+    monkeypatch.setattr("smoketree.backends.blender.subprocess.run", fake_run)
+    monkeypatch.setenv("BLENDER_PATH", "/fake/blender")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: to_blend\n    backend: blender\n"
+        '    in:\n      mesh: "work/{m}/model.glb"\n'
+        '    out:\n      blend: "work/{m}/model.blend"\n'
+        '    config:\n      script: "scripts/glb_to_blend.py"\n',
+    )
+    write(tmp_path, "scripts/glb_to_blend.py", "# bpy script\n")
+    write(tmp_path, "work/alpha/model.glb", "glb bytes")
+    with pytest.raises(ExecutionError, match="didn't write output"):
+        run(project)
+
+
+def test_blender_backend_timeout_raises(tmp_path: Path, monkeypatch):
+    import subprocess
+
+    def fake_run(command, cwd, env, capture_output, text, timeout):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
+
+    monkeypatch.setattr("smoketree.backends.blender.subprocess.run", fake_run)
+    monkeypatch.setenv("BLENDER_PATH", "/fake/blender")
+
+    project = make_project(
+        tmp_path,
+        "name: g\nrules:\n"
+        "  - name: to_blend\n    backend: blender\n"
+        '    in:\n      mesh: "work/{m}/model.glb"\n'
+        '    out:\n      blend: "work/{m}/model.blend"\n'
+        '    config:\n      script: "scripts/glb_to_blend.py"\n      timeout: 5\n',
+    )
+    write(tmp_path, "scripts/glb_to_blend.py", "# bpy script\n")
+    write(tmp_path, "work/alpha/model.glb", "glb bytes")
+    with pytest.raises(ExecutionError, match="timed out"):
+        run(project)

@@ -111,5 +111,5 @@ they set are the same `status.yaml` files this example edits by hand.
 
 ## Next
 
-**09 · Working Files** *(planned)* — generated files a human hand-edits, kept in sync with
-`author` + `reconcile`. See the [examples roadmap](../README.md).
+**[09 · Working Files](../09-working-files/)** — generated files a human hand-edits, kept in
+sync with `author` + `reconcile`.

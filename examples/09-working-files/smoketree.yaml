@@ -1,0 +1,26 @@
+name: working-files
+
+defaults:
+  max_iterations: 100
+
+rules:
+  # Draft a bio from the facts. `author` splits the output into two files:
+  #   bio.template.md  — the managed draft, regenerated whenever the facts change
+  #   bio.md           — a courtesy copy, seeded once, then YOURS to hand-edit
+  # Downstream reads bio.md, so your edits flow through and survive regeneration.
+  - name: draft
+    in:
+      facts: "sources/profile/{person}/facts.txt"
+    out:
+      bio: "work/profile/{person}/bio.md"
+    author: [bio]
+    run: "python scripts/draft.py {facts} {bio}"
+
+  # Assemble the (hand-polished) bios into one directory page. Globs bio.md, not the
+  # template, so it always reflects the human copy.
+  - name: directory
+    in:
+      bios: "work/profile/*/bio.md"
+    out:
+      page: "directory.md"
+    run: "cat {bios} > {page}"

@@ -27,6 +27,7 @@ class Defaults(BaseModel):
 
     comfyui_url: str = "http://localhost:8188"
     ollama_url: str = "http://localhost:11434"
+    blender_path: str | None = None
     image_max_edge: int = 1536
     # Fixpoint circuit breaker: a single `run` performs at most this many passes
     # before erroring. Guards a runaway rule from re-invoking paid transforms forever.
