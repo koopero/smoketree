@@ -25,13 +25,7 @@ of many workflows, models, scripts, assets, review decisions, and final assembli
 From this repo:
 
 ```bash
-uv sync --extra workspace
-```
-
-If you use hosted Replicate models:
-
-```bash
-uv sync --extra workspace --extra replicate
+uv sync
 ```
 
 Then run commands with `uv run smoketree ...`, or activate the virtualenv and call
@@ -256,6 +250,7 @@ Rules run through backends:
 | `replicate` | Hosted image, video, audio, and utility models. |
 | `comfyui` | A ComfyUI workflow served by a local ComfyUI instance. |
 | `explode` | Fan a YAML/JSON list into per-item files and directories. |
+| `blender` | A headless `bpy` script, for procedural scenes/renders. |
 
 API keys are read from the project `.env` or the environment:
 
@@ -273,6 +268,7 @@ name: my-project
 defaults:
   ollama_url: http://localhost:11434
   comfyui_url: http://localhost:8188
+  blender_path: /Applications/Blender.app/Contents/MacOS/Blender
   max_iterations: 100
 ```
 

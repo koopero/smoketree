@@ -814,10 +814,11 @@ wheels = [
 
 [[package]]
 name = "smoketree"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "jinja2" },
     { name = "jsonschema" },
@@ -826,29 +827,20 @@ dependencies = [
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "typer" },
-]
-
-[package.optional-dependencies]
-replicate = [
     { name = "replicate" },
-]
-workspace = [
-    { name = "fastapi" },
+    { name = "typer" },
     { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
 dev = [
-    { name = "fastapi" },
     { name = "pytest" },
-    { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40" },
-    { name = "fastapi", marker = "extra == 'workspace'", specifier = ">=0.110" },
+    { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "jsonschema", specifier = ">=4.0" },
@@ -857,18 +849,13 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.6" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "replicate", marker = "extra == 'replicate'", specifier = ">=0.32" },
+    { name = "replicate", specifier = ">=0.32" },
     { name = "typer", specifier = ">=0.12" },
-    { name = "uvicorn", marker = "extra == 'workspace'", specifier = ">=0.27" },
-]
-provides-extras = ["workspace", "replicate"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "fastapi", specifier = ">=0.110" },
-    { name = "pytest", specifier = ">=8.0" },
     { name = "uvicorn", specifier = ">=0.27" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.0" }]
 
 [[package]]
 name = "sniffio"
